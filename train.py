@@ -1,9 +1,11 @@
 """Pre-train the 200M-A25M MoE from scratch on data/train.bin.
 
-Usage:
+Usage (NPU, full-speed):
     python train.py --total-tokens 2800000000 \
-                    --batch-size 32 --micro-batch 8 --ctx 2048 \
+                    --batch-size 32 --micro-batch 16 --ctx 2048 \
+                    --flash-attention --gradient-checkpointing 0 \
                     --out-dir runs/moe-200m
+    # --fa-layout bsh to switch npu_fusion_attention layout (default bnsd)
 
 Data format (nanoGPT style):
     data/train.bin / data/val.bin : uint16 token stream (memmap)
@@ -15,6 +17,13 @@ Key details:
   - grad accumulation + gradient clipping
   - checkpoints every --save-every steps (also keep best-val)
   - MoE router z/aux losses are added to the cross-entropy
+  - speed tricks (all enabled by default):
+      * async micro-batch prefetch (DataPrefetcher) overlaps H2D copies
+        with compute
+      * fused per-expert weight caches are rebuilt once per optimizer step
+        instead of cat()-ed every forward call
+      * NPU + --flash-attention: gradient-checkpointing auto-disables (FA frees
+        HBM); override with --gradient-checkpointing 1/0
 """
 import argparse
 import json
@@ -33,11 +42,100 @@ import device as device_lib  # noqa: E402
 from model import Config, MoETransformer  # noqa: E402
 
 
+def _str2bool(v):
+    """Parse a boolean CLI value.
+
+    Accepts both the bare-flag style (``--flag``, handled via nargs='?'
+    + const) and explicit values: ``--flag 1``, ``--flag 0``,
+    ``--flag True``, ``--flag=False``, ``--flag on/off`` ... This lets
+    training-platform parameter forms (which require a value) work the
+    same as local command lines.
+    """
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r} (use 1/0/true/false)")
+
+
 def get_batch(mmap, idx, bs, ctx, device):
     starts = torch.randint(0, len(mmap) - ctx - 1, (bs,))
     x = torch.stack([torch.from_numpy(mmap[s:s + ctx].astype(np.int64)) for s in starts])
     y = torch.stack([torch.from_numpy(mmap[s + 1:s + ctx + 1].astype(np.int64)) for s in starts])
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+
+class DataPrefetcher:
+    """Prefetch the next micro-batch on a side stream.
+
+    The host->device copies of micro-batch N+1 are queued while micro-batch N
+    is still computing, hiding the transfer latency. Falls back to a plain
+    synchronous fetch when side streams are unavailable (e.g. CPU).
+
+    ``cols`` is an iterable of ``(memmap, shift)``: each column reads
+    ``memmap[s+shift : s+shift+ctx]`` for a random start ``s`` shared across
+    all columns. Pre-train uses ``[(train, 0), (train, 1)]`` for (x, y); SFT
+    adds a third mask column ``[(data, 0), (data, 1), (mask, 1)]``.
+    ``next()`` returns a list with one tensor per column.
+    """
+
+    def __init__(self, cols, bs, ctx, device):
+        self.cols = list(cols)
+        self.bs = bs
+        self.ctx = ctx
+        self.device = torch.device(device)
+        self._stream = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            self._stream = torch.cuda.Stream()
+        elif self.device.type == "npu":
+            try:
+                import torch_npu  # noqa: F401
+                if hasattr(torch, "npu") and hasattr(torch.npu, "stream"):
+                    self._stream = torch.npu.Stream()
+            except (ImportError, AttributeError, RuntimeError):
+                self._stream = None
+        self._next = None
+        self.prefetch()
+
+    def _load(self):
+        bs, ctx = self.bs, self.ctx
+        n = len(self.cols[0][0])
+        starts = torch.randint(0, n - ctx - 1, (bs,))
+        out = []
+        for mmap, shift in self.cols:
+            out.append(torch.stack(
+                [torch.from_numpy(mmap[s + shift:s + shift + ctx].astype(np.int64))
+                 for s in starts.tolist()]))
+        return out
+
+    def _copy(self, cols):
+        return [c.to(self.device, non_blocking=True) for c in cols]
+
+    def prefetch(self):
+        cols = self._load()  # sync CPU work (small); copy below is async
+        if self._stream is None:
+            self._next = self._copy(cols)
+            return
+        if self.device.type == "cuda":
+            with torch.cuda.stream(self._stream):
+                self._next = self._copy(cols)
+        else:
+            with torch.npu.stream(self._stream):
+                self._next = self._copy(cols)
+
+    def next(self):
+        # make sure the previous prefetch finished before handing the batch out
+        if self._stream is not None:
+            if self.device.type == "cuda":
+                torch.cuda.current_stream().wait_stream(self._stream)
+            else:
+                torch.npu.current_stream().wait_stream(self._stream)
+        batch = self._next
+        self.prefetch()  # start loading the following micro-batch now
+        return batch
 
 
 @torch.no_grad()
@@ -100,9 +198,20 @@ def main():
     # model
     ap.add_argument("--config", default="moe-200m")
     ap.add_argument("--init-from", default=None, help="checkpoint to resume from")
-    ap.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
-                    help="激活重计算，省显存（训练变慢 ~30%）。NPU 上默认开启（32GB HBM + 全量专家激活容易 OOM）；"
-                         "CUDA/CPU 默认关闭。用 --no-gradient-checkpointing 显式关闭")
+    # 布尔参数同时支持裸写（--flag）和带值（--flag 1/0/True/False）两种写法，
+    # 方便训练平台以 key=value 传参。
+    ap.add_argument("--gradient-checkpointing", type=_str2bool, default=None,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="激活重计算，省显存（训练变慢约 30%%，argparse help 转义）。NPU 上默认开启（32GB HBM + 全量专家激活容易 OOM）；"
+                         "CUDA/CPU 默认关闭。关闭用 --gradient-checkpointing 0 / False")
+    ap.add_argument("--flash-attention", type=_str2bool, default=False,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="启用 FlashAttention（CUDA flash-attn / Ascend npu_fusion_attention）。"
+                         "可用 --flash-attention 1/0、--flash-attention True/False 显式指定；"
+                         "NPU 上建议开启，可同时提速并省显存；默认关闭")
+    ap.add_argument("--fa-layout", default="bnsd", choices=["bnsd", "bsh"],
+                    help="npufusion_attention 输入布局：bnsd=[B,N,S,D]（默认），bsh=[B,S,H]。"
+                         "部分 CANN 版本只对其中一种布局提供 kernel")
     # run
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
@@ -117,12 +226,19 @@ def main():
     device = device_lib.get_device()
 
     # NPU 默认开启 gradient checkpointing：全量专家激活很大，32GB HBM 容易 OOM。
-    # 用户可用 --no-gradient-checkpointing 显式关闭（CUDA/CPU 不受影响，默认关）。
+    # 但若 FlashAttention 已开启（--flash-attention），省下的激活内存足够关掉重计算，
+    # 此时自动默认关闭（训练快 ~30%）。用户始终可用 --gradient-checkpointing 1/0
+    # 显式覆盖（CUDA/CPU 不受影响，默认关）。
     if args.gradient_checkpointing is None:
-        args.gradient_checkpointing = (device.type == "npu")
-        if args.gradient_checkpointing:
-            print("device is NPU: gradient-checkpointing enabled by default "
-                  "(pass --no-gradient-checkpointing to disable)")
+        if device.type == "npu" and args.flash_attention:
+            args.gradient_checkpointing = False
+            print("device is NPU + --flash-attention: gradient-checkpointing disabled "
+                  "(FA frees HBM; pass --gradient-checkpointing 1 to force)")
+        else:
+            args.gradient_checkpointing = (device.type == "npu")
+            if args.gradient_checkpointing:
+                print("device is NPU: gradient-checkpointing enabled by default "
+                      "(pass --gradient-checkpointing 0 to disable)")
 
     data_dir = Path(args.data_dir)
     train_mmap = np.memmap(data_dir / "train.bin", dtype=np.uint16, mode="r")
@@ -133,6 +249,8 @@ def main():
     cfg = Config.from_name(args.config)
     cfg.dropout = args.dropout
     cfg.gradient_checkpointing = args.gradient_checkpointing
+    cfg.use_flash_attn = args.flash_attention
+    cfg.fa_layout = args.fa_layout
     if meta["vocab_size"] != cfg.vocab_size:
         print(f"note: overriding cfg.vocab_size {cfg.vocab_size} -> {meta['vocab_size']} from meta.json")
         cfg.vocab_size = meta["vocab_size"]
@@ -201,6 +319,8 @@ def main():
 
     model.train()
     print(f"starting training on {device}")
+    prefetcher = DataPrefetcher(
+        [(train_mmap, 0), (train_mmap, 1)], args.micro_batch, args.ctx, device)
     t0 = time.time()
     running = 0.0
     n_running = 0
@@ -209,7 +329,7 @@ def main():
     while step < total_steps:
         # micro-batch loop with gradient accumulation
         for mb in range(grad_accum):
-            x, y = get_batch(train_mmap, None, args.micro_batch, args.ctx, device)
+            x, y = prefetcher.next()
             with device_lib.amp_context(device):
                 _, losses_d = model(x, y)
                 loss = losses_d["total"] / grad_accum
@@ -231,6 +351,8 @@ def main():
             scaler.update()
         else:
             optim.step()
+        # 权重已更新：重建融合的专家权重缓存（cat 结果），供下一轮 forward 使用
+        model.refresh_expert_caches()
         optim.zero_grad(set_to_none=True)
         step += 1
 

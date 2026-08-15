@@ -51,6 +51,12 @@ class Config:
 
     # --- training -------------------------------------------------------
     gradient_checkpointing: bool = False
+    # 是否启用 FlashAttention（CUDA flash-attn / Ascend npu_fusion_attention）。
+    # 通过训练脚本的 --flash-attention 参数控制，不再使用环境变量。
+    use_flash_attn: bool = False
+    # npu_fusion_attention 的输入布局："bnsd"（[B,N,S,D]）或 "bsh"（[B,S,H]）。
+    # 部分 CANN 版本只对其中一种布局提供 kernel，可在此切换。
+    fa_layout: str = "bnsd"
 
     @classmethod
     def from_name(cls, name: str) -> "Config":

@@ -26,6 +26,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 import device as device_lib
 from model import Config, MoETransformer
+from train import DataPrefetcher, _str2bool
 
 
 def get_batch_masked(data_mmap, mask_mmap, idx, bs, ctx, device):
@@ -91,8 +92,18 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=500)
-    ap.add_argument("--gradient-checkpointing", action="store_true",
-                    help="激活重计算，省显存（训练变慢 ~30%）。32GB 显存且 micro-batch 大时建议开启")
+    # 布尔参数同时支持裸写（--flag）和带值（--flag 1/0/True/False）两种写法，
+    # 方便训练平台以 key=value 传参。
+    ap.add_argument("--gradient-checkpointing", type=_str2bool, default=False,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="激活重计算，省显存（训练变慢约 30%%，argparse help 转义）。32GB 显存且 micro-batch 大时建议开启；"
+                         "关闭用 --gradient-checkpointing 0 / False")
+    ap.add_argument("--flash-attention", type=_str2bool, default=False,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="启用 FlashAttention（CUDA flash-attn / Ascend npu_fusion_attention）。NPU 上建议开启；"
+                         "可用 --flash-attention 1/0 显式指定")
+    ap.add_argument("--fa-layout", default="bnsd", choices=["bnsd", "bsh"],
+                    help="npufusion_attention 输入布局：bnsd=[B,N,S,D]（默认），bsh=[B,S,H]")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -113,6 +124,8 @@ def main():
     cfg = Config(**{k: v for k, v in ckpt["cfg"].items() if k in Config().__dict__})
     cfg.dropout = 0.0  # no dropout during SFT
     cfg.gradient_checkpointing = args.gradient_checkpointing
+    cfg.use_flash_attn = args.flash_attention
+    cfg.fa_layout = args.fa_layout
     model = MoETransformer(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     print(f"loaded pretrained weights from {args.init_from} (pretrain step {ckpt.get('step')})")
@@ -157,9 +170,12 @@ def main():
     running, n_running = 0.0, 0
     t0 = time.time()
     best_val = float("inf")
+    prefetcher = DataPrefetcher(
+        [(train_data, 0), (train_data, 1), (train_mask, 1)],
+        args.micro_batch, args.ctx, device)
     while step < total_steps:
         for mb in range(grad_accum):
-            x, y, m = get_batch_masked(train_data, train_mask, None, args.micro_batch, args.ctx, device)
+            x, y, m = prefetcher.next()
             with device_lib.amp_context(device):
                 logits, _ = model(x)
                 loss = torch.nn.functional.cross_entropy(
@@ -174,6 +190,8 @@ def main():
         for g in optim.param_groups:
             g["lr"] = lr_at(step)
         optim.step()
+        # 权重已更新：重建融合的专家权重缓存（cat 结果），供下一轮 forward 使用
+        model.refresh_expert_caches()
         optim.zero_grad(set_to_none=True)
         step += 1
 

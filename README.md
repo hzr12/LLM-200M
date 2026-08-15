@@ -51,22 +51,35 @@ pip install torch_npu==2.1.0 -i https://repo.huaweicloud.com/repository/pypi/sim
 代码已通过 `device.py` 自动检测设备（NPU > CUDA > CPU），脚本无需任何改动即可在 910 上运行：
 
 ```bash
-python train.py --total-tokens 2800000000 --batch-size 32 --micro-batch 8 --ctx 2048 --out-dir runs/moe-200m
+# 全速训练（FA + 关 checkpoint + 大 micro-batch）：
+python train.py --total-tokens 2800000000 --batch-size 32 \
+    --micro-batch 16 --ctx 2048 --flash-attention \
+    --gradient-checkpointing 0 --out-dir runs/moe-200m
 python sft_train.py --init-from runs/moe-200m/ckpt_best.pt --out-dir runs/moe-200m-sft
 python chat.py --checkpoint runs/moe-200m-sft/sft_best.pt
 ```
 
 > 说明：
-> - 910 上默认走 `npu_fusion_attention`（CANN 的 FA 算子），通过显式 `atten_mask`
->   构造下三角因果掩码，保证与 CUDA flash-attn 因果语义一致；
-> - AMP 精度默认 **bf16**（无需 loss scaling）。若在 CANN8 + torch_npu 2.1.0 下
->   bf16 autocast 报错或精度异常，可设环境变量 `LLM_SNN_AMP=fp16` 切到 fp16
->   （此时建议配合 GradScaler，脚本当前未内置）；
-> - AdamW 的 `fused=True` 仅 CUDA 启用，NPU 自动降级为普通实现；
-> - **32GB 显存（910）**：模型+优化器固定约 3.2GB，激活内存取决于 FA 是否生效。
->   默认 `--micro-batch 8 --ctx 2048` 在 FA 生效时约 6-8GB，32GB 很宽裕；
->   若 FA 未生效（fallback 手写 attention），建议 `--gradient-checkpointing`
->   开启激活重计算（省显存、慢 ~30%），或减小 `--micro-batch`（如 4）。
+> - **布尔参数写法**：`--flash-attention` / `--gradient-checkpointing` 既支持
+>   裸写（`--flash-attention` 即开启），也支持带值（`--flash-attention 1`、
+>   `--flash-attention 0`、`--flash-attention True/False`、`--flash-attention=0`），
+>   方便训练平台以 key=value 传参；关闭统一用 `--xxx 0` / `--xxx False`。
+> - **FlashAttention**：默认关闭，用 `--flash-attention` 显式开启（这是训练参数，
+>   不是环境变量，训练环境直接用命令行传即可）。CANN 8.0.RC1 的
+>   FlashAttentionScore 对部分 shape 无 binary，代码默认走 **BNSD 4 维布局**
+>   （可用 `--fa-layout bsh` 切回 3 维）。仍报错时自动 fallback 到手写
+>   attention，并按需 `--gradient-checkpointing` 补显存；
+> - **gradient checkpointing**：NPU 默认开启；当用了 `--flash-attention` 时自动关闭
+>   （FA 省下的 HBM 足够，训练快 ~30%）。可随时用 `--gradient-checkpointing 1/0`
+>   显式覆盖；
+> - **AMP 精度**：默认 **fp16**（`LLM_SNN_AMP` 未设时），train.py 自动配
+>   GradScaler；设 `LLM_SNN_AMP=bf16` 可切 bf16（NPU 上 torch_npu 2.1 的
+>   autocast 不支持 bf16 会静默降级 fp32，不推荐）；
+> - **内置提速**：micro-batch 用 side-stream 异步预取；专家权重融合矩阵的 cat
+>   结果每 optimizer step 只重建一次（非每层每次 forward）；
+> - **32GB 显存（910）**：模型+优化器固定约 3.2GB。FA 生效 + 关 checkpoint 时
+>   `--micro-batch 16 --ctx 2048` 约 8-12GB，很宽裕；若 FA 未生效，建议
+>   `--micro-batch 4` 或开 `--gradient-checkpointing`。
 
 **在 OpenI 启智云脑上训练（C2NET 接入）**：
 
@@ -202,4 +215,9 @@ python chat.py --checkpoint runs/moe-200m-sft/sft_best.pt --prompt "帮我算一
 ## 训练速度参考
 
 A100 40G 上 200M 参数 + 梯度累积，预计 15–30K tokens/s（取决于 flash-attn 是否可用）。
-按 25K tok/s 计，2.8B token 约 **31 小时**；若 `--micro-batch` 调大或开 flash-attn 更快。
+按 25K tok/s 计，2.8B token 约 **31 小时**。昇腾 910 上按以下顺序提速：
+
+1. 加 `--flash-attention`：FA 生效，attention 耗时与激活内存同时下降；
+2. 随之自动关闭 gradient checkpointing：直接快 ~30%；
+3. 把 `--micro-batch` 提到 16（减少 grad_accum 里小 matmul 的比例）；
+4. 以上均无需改代码，异步预取与专家权重缓存已内置默认开启。

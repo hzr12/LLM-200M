@@ -11,6 +11,7 @@ the expert-router parameters tiny. Each layer has its own experts.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -82,6 +83,8 @@ class Attention(nn.Module):
         self.n_kv_heads = cfg.n_kv_heads
         self.head_dim = cfg.head_dim
         self.repeats = self.n_heads // self.n_kv_heads
+        self.use_flash_attn = cfg.use_flash_attn
+        self.fa_layout = cfg.fa_layout
         d = cfg.d_model
         self.q_proj = nn.Linear(d, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
@@ -106,32 +109,44 @@ class Attention(nn.Module):
                     q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(),
                     v.transpose(1, 2).contiguous(), causal=True)
                 return self.o_proj(y.reshape(B, T, -1))
-            elif dev_type == "npu" and q.dtype in (torch.float16, torch.bfloat16):
+            elif (dev_type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+                  and self.use_flash_attn):
+                # npu_fusion_attention 通过训练脚本的 --flash-attention 参数启用：
+                # CANN 8.0.RC1 的 FlashAttentionScore 对部分 shape 无 binary，
+                # 异步报错会导致训练崩溃。
+                # 默认用 BNSD 4 维布局 [B, N, S, D]——部分 CANN 版本只对 BNSD
+                # 提供 kernel，比 3 维 BSH 更稳。仍不支持时可用
+                # --fa-layout bsh 切回 3 维布局，或确认 CANN 版本。
                 import torch_npu
-                # causal mask [1,1,T,T], True = 被 mask 的未来位置（NPU 语义）。
-                # 缓存避免每次重建；torch_npu 2.1 / CANN8 用显式 atten_mask 最稳妥。
                 if (getattr(self, "_npu_mask", None) is None
                         or self._npu_mask.shape[-1] < T):
                     m = torch.triu(
                         torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
                     self._npu_mask = m.view(1, 1, T, T)
                 atten_mask = self._npu_mask[..., :T, :T]
-                # npu_fusion_attention 的 "BSH" 布局要求 q/k/v 为 3 维
-                # [B, S, H]，H = n_heads*head_dim（所有 head 展平拼接）。
-                # q/k/v 当前是 [B, n_heads, T, D] -> transpose 后 [B, T, n_heads, D]，
-                # 需再展平最后一维成 [B, T, n_heads*D]。
-                qh = q.transpose(1, 2).reshape(B, T, -1).contiguous()
-                kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
-                vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
-                y, *_ = torch_npu.npu_fusion_attention(
-                    qh, kh, vh, self.n_heads, "BSH",
-                    atten_mask=atten_mask,
-                    scale=self.head_dim ** -0.5,
-                    inner_precise=0)
-                return self.o_proj(y.reshape(B, T, -1))
+                layout = self.fa_layout.strip().lower()
+                if layout == "bnsd":
+                    # q/k/v 此时都是 [B, n_heads, T, head_dim]（k/v 已 repeat）
+                    y, *_ = torch_npu.npu_fusion_attention(
+                        q.contiguous(), k.contiguous(), v.contiguous(),
+                        self.n_heads, "BNSD",
+                        atten_mask=atten_mask,
+                        scale=self.head_dim ** -0.5,
+                        inner_precise=0)
+                    y = y.transpose(1, 2).reshape(B, T, -1)
+                else:  # BSH: [B, T, n_heads*head_dim]
+                    qh = q.transpose(1, 2).reshape(B, T, -1).contiguous()
+                    kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
+                    vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
+                    y, *_ = torch_npu.npu_fusion_attention(
+                        qh, kh, vh, self.n_heads, "BSH",
+                        atten_mask=atten_mask,
+                        scale=self.head_dim ** -0.5,
+                        inner_precise=0)
+                    y = y.reshape(B, T, -1)
+                return self.o_proj(y)
         except Exception as e:  # noqa: BLE001
-            # fallback: 慢速 fp32/bf16 attention（[B, h, T, T] 大矩阵，显存大）
-            # 在 NPU 上打印一次警告，便于排查 FA 未命中的原因
+            # fallback: 慢速 attention（[B, h, T, T] 大矩阵，显存大）
             if dev_type == "npu" and not getattr(self, "_fa_warned", False):
                 self._fa_warned = True
                 print(f"warning: npu_fusion_attention failed ({e!r}); "
@@ -227,6 +242,9 @@ class MoEBlock(nn.Module):
                 [SwiGLU(cfg.d_model, cfg.shared_expert_hidden) for _ in range(cfg.n_shared_experts)])
         else:
             self.shared_experts = nn.ModuleList()
+        # fused per-expert weight matrices (W_gate/W_up/W_down), rebuilt after
+        # every optimizer step instead of cat()-ing them each forward call.
+        self._expert_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.norm1(x), cos, sin)
@@ -236,6 +254,24 @@ class MoEBlock(nn.Module):
         if self.shared_mlp is not None:
             h = h + self.shared_mlp(n)
         return h, losses
+
+    def refresh_expert_cache(self) -> None:
+        """Rebuild the fused per-expert weight matrices after weights change.
+
+        Must be called after optimizer.step() (or load_state_dict) so the
+        cached cat() views stay in sync with the expert parameters. The cache
+        is a plain tensor built from the Parameter leaves (NOT a detached
+        buffer), so gradients flow back to the experts normally.
+        """
+        H = self.experts[0].mlp.gate.out_features
+        W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
+        W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
+        W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
+        if self._expert_cache is None:
+            self._expert_cache = (W_gate, W_up, W_down)
+        else:
+            for dst, src in zip(self._expert_cache, (W_gate, W_up, W_down)):
+                dst.copy_(src)
 
     def _moe(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
         B, T, D = x.shape
@@ -253,10 +289,12 @@ class MoEBlock(nn.Module):
         # Per-expert Linear weights are concatenated into single [E*H, D] /
         # [D, E*H] matrices so the whole expert layer is 3 fused matmuls
         # instead of 16 sequential SwiGLU calls (much higher NPU utilization).
+        # The cat() is cached and only rebuilt after each optimizer step
+        # (refresh_expert_cache), so we don't redo it every forward call.
+        if self._expert_cache is None or self._expert_cache[0].device != flat.device:
+            self.refresh_expert_cache()
+        W_gate, W_up, W_down = self._expert_cache
         H = self.experts[0].mlp.gate.out_features
-        W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
-        W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
-        W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
         S = flat.shape[0]
         g_all = F.linear(flat, W_gate)                       # [S, E*H]
         u_all = F.linear(flat, W_up)                         # [S, E*H]
@@ -289,6 +327,11 @@ class MoETransformer(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight  # weight tying
         self._rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Rebuild fused expert-weight caches once a checkpoint has been fully
+        # loaded (load_state_dict is recursive; _load_from_state_dict runs too
+        # early to see the expert weights). They are plain attributes, not
+        # buffers, so they are NOT part of state_dict.
+        self.register_load_state_dict_post_hook(self._post_load_rebuild)
 
         self.apply(self._init_weights)
         # small init for output layer
@@ -303,6 +346,15 @@ class MoETransformer(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def refresh_expert_caches(self) -> None:
+        """Rebuild all fused per-expert weight caches (after step / load)."""
+        for layer in self.layers:
+            layer.refresh_expert_cache()
+
+    def _post_load_rebuild(self, module, incompatible_keys) -> None:
+        """Called after load_state_dict finishes (all submodules loaded)."""
+        self.refresh_expert_caches()
 
     def _rope(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         if self._rope_cache is None or self._rope_cache[0].shape[0] < seq_len:
