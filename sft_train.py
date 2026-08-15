@@ -181,6 +181,8 @@ def main():
         [(train_data, 0), (train_data, 1), (train_mask, 1)],
         args.micro_batch, args.ctx, device)
     while step < total_steps:
+        # 设备上累积 loss，log 时才同步一次 .item()（避免每 micro-batch 强制同步）
+        running_acc = torch.zeros((), device=device)
         for mb in range(grad_accum):
             x, y, m = prefetcher.next()
             with device_lib.amp_context(device):
@@ -190,8 +192,9 @@ def main():
                 loss = (loss.view(args.micro_batch, -1) * m).sum() / m.sum()
                 loss = loss / grad_accum
             loss.backward()
-            running += loss.item() * grad_accum
+            running_acc += loss.detach()
             n_running += 1
+        running += running_acc.item() * grad_accum
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for g in optim.param_groups:

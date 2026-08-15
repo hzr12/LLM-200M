@@ -91,11 +91,16 @@ class Attention(nn.Module):
         self.repeats = self.n_heads // self.n_kv_heads
         self.use_flash_attn = cfg.use_flash_attn
         self.fa_layout = cfg.fa_layout
+        self._scale = self.head_dim ** -0.5
         d = cfg.d_model
         self.q_proj = nn.Linear(d, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, d, bias=False)
+        # Cached additive causal mask (upper triangle = -inf), lazily built in
+        # forward. Replacing per-call triu()+masked_fill() with a broadcast add
+        # removes one O(T^2) elementwise kernel per layer per micro-batch.
+        self.register_buffer("_causal_bias", None, persistent=False)
 
     def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype) -> bool:
         """Synchronously check whether npu_fusion_attention is usable.
@@ -121,14 +126,14 @@ class Attention(nn.Module):
             if layout == "bnsd":
                 y, *_ = torch_npu.npu_fusion_attention(
                     q, k, v, self.n_heads, "BNSD", atten_mask=m,
-                    scale=self.head_dim ** -0.5, inner_precise=0)
+                    scale=self._scale, inner_precise=0)
             else:
                 qh = q.transpose(1, 2).reshape(1, S, -1).contiguous()
                 kh = k.transpose(1, 2).reshape(1, S, -1).contiguous()
                 vh = v.transpose(1, 2).reshape(1, S, -1).contiguous()
                 y, *_ = torch_npu.npu_fusion_attention(
                     qh, kh, vh, self.n_heads, "BSH", atten_mask=m,
-                    scale=self.head_dim ** -0.5, inner_precise=0)
+                    scale=self._scale, inner_precise=0)
             torch.npu.synchronize()
             Attention._npu_fa_ok = True
         except Exception as e:  # noqa: BLE001
@@ -182,7 +187,7 @@ class Attention(nn.Module):
                             q.contiguous(), k.contiguous(), v.contiguous(),
                             self.n_heads, "BNSD",
                             atten_mask=atten_mask,
-                            scale=self.head_dim ** -0.5,
+                            scale=self._scale,
                             inner_precise=0)
                         y = y.transpose(1, 2).reshape(B, T, -1)
                     else:  # BSH: [B, T, n_heads*head_dim]
@@ -190,9 +195,9 @@ class Attention(nn.Module):
                         kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
                         vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
                         y, *_ = torch_npu.npu_fusion_attention(
-                            qh, kh, vh, self.n_heads, "BSH",
+                            qh, kh, vh,                             self.n_heads, "BSH",
                             atten_mask=atten_mask,
-                            scale=self.head_dim ** -0.5,
+                            scale=self._scale,
                             inner_precise=0)
                         y = y.reshape(B, T, -1)
                     return self.o_proj(y)
@@ -205,10 +210,19 @@ class Attention(nn.Module):
                     print(f"warning: npu_fusion_attention failed ({e!r}); "
                           f"disabling FlashAttention, falling back to slow attention "
                           f"(q.dtype={q.dtype})", flush=True)
-        att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        att = att.masked_fill(
-            torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1),
-            float("-inf"))
+        # slow fallback: cached additive causal bias instead of rebuilding
+        # torch.triu(torch.ones(T,T)) + masked_fill() every forward call.
+        if (self._causal_bias is None
+                or self._causal_bias.shape[-1] < T
+                or self._causal_bias.dtype != x.dtype):
+            b = torch.triu(torch.full((T, T), float("-inf"),
+                                      device=x.device, dtype=x.dtype), diagonal=1)
+            self._causal_bias = b[None, None]
+        # Fold the 1/sqrt(d) scale into q (O(T*D) work) instead of scaling the
+        # full O(T^2) QK^T output, and add the causal bias in-place to avoid an
+        # extra O(T^2) allocation per layer per micro-batch.
+        att = (q * self._scale) @ k.transpose(-2, -1)
+        att.add_(self._causal_bias[..., :T, :T])
         att = F.softmax(att, dim=-1).to(v.dtype)
         y = (att @ v).transpose(1, 2).reshape(B, T, -1)
         return self.o_proj(y)
@@ -237,9 +251,12 @@ class Expert(nn.Module):
 
 @dataclass
 class RouterOutput:
-    logits: torch.Tensor   # [B*T, n_experts]
-    z_loss: torch.Tensor   # scalar
-    aux_loss: torch.Tensor # scalar
+    logits: torch.Tensor    # [B*T, n_experts]
+    probs: torch.Tensor     # [B*T, n_experts] softmax(logits.float())
+    top_probs: torch.Tensor # [B*T, top_k]
+    top_idx: torch.Tensor   # [B*T, top_k]
+    z_loss: torch.Tensor    # scalar
+    aux_loss: torch.Tensor  # scalar
 
 
 class Router(nn.Module):
@@ -274,7 +291,7 @@ class Router(nn.Module):
             f = probs_sum / B
             p = expert_load / B
             aux_loss = self.n_experts * (f * p).sum()
-        return RouterOutput(logits, z_loss, aux_loss)
+        return RouterOutput(logits, probs, top_probs, top_idx, z_loss, aux_loss)
 
 
 class MoEBlock(nn.Module):
@@ -331,12 +348,11 @@ class MoEBlock(nn.Module):
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         out = self.router(flat)
-        logits, z_loss, aux_loss = out.logits, out.z_loss, out.aux_loss
-        probs = F.softmax(logits.float(), dim=-1)
-        top_probs, top_idx = torch.topk(probs, k=self.top_k, dim=-1)
-        top_probs = top_probs.to(x.dtype)
-
-        top_idx = top_idx.view(-1, self.top_k)
+        # Router 内部已算好 softmax/topk 并缓存到 RouterOutput，这里直接复用，
+        # 避免每层重复 F.softmax + torch.topk（12 层 × checkpoint 重算）。
+        top_probs = out.top_probs.to(x.dtype)
+        top_idx = out.top_idx
+        z_loss, aux_loss = out.z_loss, out.aux_loss
         # NPU-safe routing: fixed-shape compute only.  No nonzero / index_add_ /
         # data-dependent control flow (both hang CANN graph compilation).
         # All experts run on ALL tokens; the top-k weights gate their outputs.

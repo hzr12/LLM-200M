@@ -340,6 +340,9 @@ def main():
 
     while step < total_steps:
         # micro-batch loop with gradient accumulation
+        # 在设备上累积 loss，log 时才同步一次 .item()。原实现每 micro-batch
+        # 调一次 .item()，会强制清空 NPU 算子队列、打断 prefetch 的异步重叠。
+        running_acc = torch.zeros((), device=device)
         for mb in range(grad_accum):
             x, y = prefetcher.next()
             with device_lib.amp_context(device):
@@ -349,8 +352,9 @@ def main():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            running += loss.item() * grad_accum
+            running_acc += loss.detach()
             n_running += 1
+        running += running_acc.item() * grad_accum
 
         # gradient clipping + step
         if scaler is not None:
