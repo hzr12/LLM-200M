@@ -191,9 +191,9 @@ class Router(nn.Module):
             B = x.shape[0] * x.shape[1]
             # load balancing: uniform expert load
             probs_sum = probs.sum(dim=0)          # [E]
-            onehot = torch.zeros_like(probs)
-            onehot.scatter_(1, top_idx, 1.0)
-            expert_load = onehot.sum(dim=0)       # [E]
+            # one-hot via expand/compare: fixed shape, no scatter_ on NPU
+            onehot = F.one_hot(top_idx, num_classes=self.n_experts).float()  # [B, k, E]
+            expert_load = onehot.sum(dim=(0, 1))  # [E]
             f = probs_sum / B
             p = expert_load / B
             aux_loss = self.n_experts * (f * p).sum()
@@ -240,14 +240,15 @@ class MoEBlock(nn.Module):
 
         y = torch.zeros_like(flat)
         top_idx = top_idx.view(-1, self.top_k)
+        # NPU-safe routing: fixed-shape compute only.  No nonzero / index_add_ /
+        # data-dependent control flow (both hang CANN graph compilation).
+        # Every expert runs on ALL tokens; the top-k weights gate its output
+        # (zero for non-routed experts), which is numerically identical to the
+        # sparse gather-add version but with statically-known shapes.
         for e in range(self.n_experts):
-            mask = top_idx == e                      # [B*T, k]
-            token_ids, k_pos = mask.nonzero(as_tuple=True)
-            if token_ids.numel() == 0:
-                continue
-            weights = top_probs[token_ids, k_pos]
-            expert_out = self.experts[e](flat[token_ids])
-            y.index_add_(0, token_ids, expert_out * weights.unsqueeze(-1))
+            mask = top_idx == e                                          # [S, k] bool, fixed shape
+            w = (mask.to(top_probs.dtype) * top_probs).sum(-1, keepdim=True)  # [S, 1]
+            y = y + self.experts[e](flat) * w
         y = y.reshape(B, T, D)
 
         if self.n_shared_experts > 0:
