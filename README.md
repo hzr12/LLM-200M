@@ -63,7 +63,10 @@ python chat.py --checkpoint runs/moe-200m-sft/sft_best.pt
 >   bf16 autocast 报错或精度异常，可设环境变量 `LLM_SNN_AMP=fp16` 切到 fp16
 >   （此时建议配合 GradScaler，脚本当前未内置）；
 > - AdamW 的 `fused=True` 仅 CUDA 启用，NPU 自动降级为普通实现；
-> - 显存有限时减小 `--micro-batch` 即可（如 `--micro-batch 4`）。
+> - **32GB 显存（910）**：模型+优化器固定约 3.2GB，激活内存取决于 FA 是否生效。
+>   默认 `--micro-batch 8 --ctx 2048` 在 FA 生效时约 6-8GB，32GB 很宽裕；
+>   若 FA 未生效（fallback 手写 attention），建议 `--gradient-checkpointing`
+>   开启激活重计算（省显存、慢 ~30%），或减小 `--micro-batch`（如 4）。
 
 **在 OpenI 启智云脑上训练（C2NET 接入）**：
 

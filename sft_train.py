@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--save-every", type=int, default=500)
+    ap.add_argument("--gradient-checkpointing", action="store_true",
+                    help="激活重计算，省显存（训练变慢 ~30%）。32GB 显存且 micro-batch 大时建议开启")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -110,6 +112,7 @@ def main():
     ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
     cfg = Config(**{k: v for k, v in ckpt["cfg"].items() if k in Config().__dict__})
     cfg.dropout = 0.0  # no dropout during SFT
+    cfg.gradient_checkpointing = args.gradient_checkpointing
     model = MoETransformer(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     print(f"loaded pretrained weights from {args.init_from} (pretrain step {ckpt.get('step')})")

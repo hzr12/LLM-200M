@@ -100,6 +100,8 @@ def main():
     # model
     ap.add_argument("--config", default="moe-200m")
     ap.add_argument("--init-from", default=None, help="checkpoint to resume from")
+    ap.add_argument("--gradient-checkpointing", action="store_true",
+                    help="激活重计算，省显存（训练变慢 ~30%）。32GB 显存且 micro-batch 大时建议开启")
     # run
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
@@ -121,6 +123,7 @@ def main():
 
     cfg = Config.from_name(args.config)
     cfg.dropout = args.dropout
+    cfg.gradient_checkpointing = args.gradient_checkpointing
     if meta["vocab_size"] != cfg.vocab_size:
         print(f"note: overriding cfg.vocab_size {cfg.vocab_size} -> {meta['vocab_size']} from meta.json")
         cfg.vocab_size = meta["vocab_size"]
