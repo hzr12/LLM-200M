@@ -128,6 +128,13 @@ def main():
     cfg.fa_layout = args.fa_layout
     model = MoETransformer(cfg).to(device)
     model.load_state_dict(ckpt["model"])
+    # FA pre-flight 同步探测：npu_fusion_attention 是异步算子，若该 CANN 环境
+    # 没有 kernel 会在同步点异步崩溃（try/except 捕获不到）。训练前探测一次，
+    # 不可用则自动禁用 FA 并降级慢速 attention。
+    if cfg.use_flash_attn and device.type == "npu":
+        if not model.check_flash_attn(device, device_lib.amp_dtype()):
+            print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
+            cfg.use_flash_attn = False
     print(f"loaded pretrained weights from {args.init_from} (pretrain step {ckpt.get('step')})")
 
     n_train_tokens = len(train_data)

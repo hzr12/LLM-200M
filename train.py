@@ -258,6 +258,18 @@ def main():
     print(f"params ~ {cfg.num_parameters()}")
 
     model = MoETransformer(cfg).to(device)
+    # FA pre-flight 同步探测：npu_fusion_attention 是异步算子，若该 CANN 环境
+    # 没有 kernel，错误只会在 backward/拷贝等同步点爆发导致崩溃（try/except
+    # 无法捕获）。这里训练前先探测一次，不可用则自动禁用 FA 并降级。
+    if cfg.use_flash_attn and device.type == "npu":
+        if not model.check_flash_attn(device, device_lib.amp_dtype()):
+            print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
+            cfg.use_flash_attn = False
+            # FA 失效后激活内存回到高占用：若用户未显式指定 checkpoint，
+            # 恢复 NPU 默认开启（避免慢速 attention + 关 checkpoint 导致 OOM）
+            if args.gradient_checkpointing is None:
+                cfg.gradient_checkpointing = True
+                print("note: re-enabling gradient-checkpointing (slow attention without FA)", flush=True)
     nparams = count_parameters(model)
     print(f"trainable params: {nparams/1e6:.2f}M (cfg estimate {cfg.num_parameters()['total']/1e6:.1f}M)")
 

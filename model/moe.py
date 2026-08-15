@@ -76,6 +76,12 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.T
 
 
 class Attention(nn.Module):
+    # Class-level synchronous probe result for npu_fusion_attention:
+    # None = untested, True = usable, False = broken on this CANN install.
+    # Shared by all Attention instances (one probe per process).
+    _npu_fa_ok: bool | None = None
+    _npu_fa_warned: bool = False
+
     def __init__(self, cfg: Config):
         super().__init__()
         assert cfg.d_model % cfg.n_heads == 0
@@ -90,6 +96,49 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, d, bias=False)
+
+    def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype) -> bool:
+        """Synchronously check whether npu_fusion_attention is usable.
+
+        The real operator is ASYNC: if this CANN install has no kernel for it
+        (e.g. "FlashAttentionScore does not has any binary"), the failure only
+        surfaces at the next sync point (backward / copy), so a try/except
+        around the call itself can never catch it and training crashes. We run
+        one small-shape probe + torch.npu.synchronize() up front and globally
+        disable FA on failure. Result is cached on the class.
+        """
+        if Attention._npu_fa_ok is not None:
+            return Attention._npu_fa_ok
+        try:
+            import torch_npu
+            S = 8
+            q = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
+            k = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
+            v = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
+            m = torch.triu(torch.ones(S, S, device=device, dtype=torch.bool),
+                           diagonal=1).view(1, 1, S, S)
+            layout = self.fa_layout.strip().lower()
+            if layout == "bnsd":
+                y, *_ = torch_npu.npu_fusion_attention(
+                    q, k, v, self.n_heads, "BNSD", atten_mask=m,
+                    scale=self.head_dim ** -0.5, inner_precise=0)
+            else:
+                qh = q.transpose(1, 2).reshape(1, S, -1).contiguous()
+                kh = k.transpose(1, 2).reshape(1, S, -1).contiguous()
+                vh = v.transpose(1, 2).reshape(1, S, -1).contiguous()
+                y, *_ = torch_npu.npu_fusion_attention(
+                    qh, kh, vh, self.n_heads, "BSH", atten_mask=m,
+                    scale=self.head_dim ** -0.5, inner_precise=0)
+            torch.npu.synchronize()
+            Attention._npu_fa_ok = True
+        except Exception as e:  # noqa: BLE001
+            Attention._npu_fa_ok = False
+            if not Attention._npu_fa_warned:
+                Attention._npu_fa_warned = True
+                print(f"warning: npu_fusion_attention unavailable on this CANN install "
+                      f"({e!r}); disabling FlashAttention, falling back to slow attention "
+                      f"(layout={self.fa_layout}, dtype={dtype})", flush=True)
+        return Attention._npu_fa_ok
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
@@ -111,46 +160,51 @@ class Attention(nn.Module):
                 return self.o_proj(y.reshape(B, T, -1))
             elif (dev_type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
                   and self.use_flash_attn):
-                # npu_fusion_attention 通过训练脚本的 --flash-attention 参数启用：
-                # CANN 8.0.RC1 的 FlashAttentionScore 对部分 shape 无 binary，
-                # 异步报错会导致训练崩溃。
-                # 默认用 BNSD 4 维布局 [B, N, S, D]——部分 CANN 版本只对 BNSD
-                # 提供 kernel，比 3 维 BSH 更稳。仍不支持时可用
-                # --fa-layout bsh 切回 3 维布局，或确认 CANN 版本。
-                import torch_npu
-                if (getattr(self, "_npu_mask", None) is None
-                        or self._npu_mask.shape[-1] < T):
-                    m = torch.triu(
-                        torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-                    self._npu_mask = m.view(1, 1, T, T)
-                atten_mask = self._npu_mask[..., :T, :T]
-                layout = self.fa_layout.strip().lower()
-                if layout == "bnsd":
-                    # q/k/v 此时都是 [B, n_heads, T, head_dim]（k/v 已 repeat）
-                    y, *_ = torch_npu.npu_fusion_attention(
-                        q.contiguous(), k.contiguous(), v.contiguous(),
-                        self.n_heads, "BNSD",
-                        atten_mask=atten_mask,
-                        scale=self.head_dim ** -0.5,
-                        inner_precise=0)
-                    y = y.transpose(1, 2).reshape(B, T, -1)
-                else:  # BSH: [B, T, n_heads*head_dim]
-                    qh = q.transpose(1, 2).reshape(B, T, -1).contiguous()
-                    kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
-                    vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
-                    y, *_ = torch_npu.npu_fusion_attention(
-                        qh, kh, vh, self.n_heads, "BSH",
-                        atten_mask=atten_mask,
-                        scale=self.head_dim ** -0.5,
-                        inner_precise=0)
-                    y = y.reshape(B, T, -1)
-                return self.o_proj(y)
+                # npu_fusion_attention 通过训练脚本的 --flash-attention 参数启用。
+                # 它是异步算子：若该 CANN 环境没有对应 kernel（FlashAttentionScore
+                # does not has any binary），错误只会延迟到同步点爆发，try/except
+                # 无法捕获。因此首次调用先做一次小 shape 同步探测，失败则全局
+                # 禁用 FA 并回退下方慢速 attention。
+                if not self._npu_fa_probe(x.device, q.dtype):
+                    pass  # fall through to slow attention below
+                else:
+                    import torch_npu
+                    if (getattr(self, "_npu_mask", None) is None
+                            or self._npu_mask.shape[-1] < T):
+                        m = torch.triu(
+                            torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+                        self._npu_mask = m.view(1, 1, T, T)
+                    atten_mask = self._npu_mask[..., :T, :T]
+                    layout = self.fa_layout.strip().lower()
+                    if layout == "bnsd":
+                        # q/k/v 此时都是 [B, n_heads, T, head_dim]（k/v 已 repeat）
+                        y, *_ = torch_npu.npu_fusion_attention(
+                            q.contiguous(), k.contiguous(), v.contiguous(),
+                            self.n_heads, "BNSD",
+                            atten_mask=atten_mask,
+                            scale=self.head_dim ** -0.5,
+                            inner_precise=0)
+                        y = y.transpose(1, 2).reshape(B, T, -1)
+                    else:  # BSH: [B, T, n_heads*head_dim]
+                        qh = q.transpose(1, 2).reshape(B, T, -1).contiguous()
+                        kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
+                        vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
+                        y, *_ = torch_npu.npu_fusion_attention(
+                            qh, kh, vh, self.n_heads, "BSH",
+                            atten_mask=atten_mask,
+                            scale=self.head_dim ** -0.5,
+                            inner_precise=0)
+                        y = y.reshape(B, T, -1)
+                    return self.o_proj(y)
         except Exception as e:  # noqa: BLE001
-            # fallback: 慢速 attention（[B, h, T, T] 大矩阵，显存大）
-            if dev_type == "npu" and not getattr(self, "_fa_warned", False):
-                self._fa_warned = True
-                print(f"warning: npu_fusion_attention failed ({e!r}); "
-                      f"falling back to slow attention (q.dtype={q.dtype})", flush=True)
+            # 兜底：同步错误（如参数非法）也全局禁用 FA 并走慢速 attention
+            if dev_type == "npu":
+                Attention._npu_fa_ok = False
+                if not Attention._npu_fa_warned:
+                    Attention._npu_fa_warned = True
+                    print(f"warning: npu_fusion_attention failed ({e!r}); "
+                          f"disabling FlashAttention, falling back to slow attention "
+                          f"(q.dtype={q.dtype})", flush=True)
         att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         att = att.masked_fill(
             torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1),
@@ -351,6 +405,17 @@ class MoETransformer(nn.Module):
         """Rebuild all fused per-expert weight caches (after step / load)."""
         for layer in self.layers:
             layer.refresh_expert_cache()
+
+    def check_flash_attn(self, device: torch.device, dtype: torch.dtype) -> bool:
+        """Pre-flight synchronous FA availability probe (Ascend only).
+
+        Call once after model.to(device) before training. Returns True if
+        npu_fusion_attention is usable; on failure it is globally disabled
+        inside the probe (falls back to slow attention) and this returns False.
+        """
+        if len(self.layers) == 0:
+            return False
+        return self.layers[0].attn._npu_fa_probe(device, dtype)
 
     def _post_load_rebuild(self, module, incompatible_keys) -> None:
         """Called after load_state_dict finishes (all submodules loaded)."""

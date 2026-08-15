@@ -65,10 +65,13 @@ python chat.py --checkpoint runs/moe-200m-sft/sft_best.pt
 >   `--flash-attention 0`、`--flash-attention True/False`、`--flash-attention=0`），
 >   方便训练平台以 key=value 传参；关闭统一用 `--xxx 0` / `--xxx False`。
 > - **FlashAttention**：默认关闭，用 `--flash-attention` 显式开启（这是训练参数，
->   不是环境变量，训练环境直接用命令行传即可）。CANN 8.0.RC1 的
->   FlashAttentionScore 对部分 shape 无 binary，代码默认走 **BNSD 4 维布局**
->   （可用 `--fa-layout bsh` 切回 3 维）。仍报错时自动 fallback 到手写
->   attention，并按需 `--gradient-checkpointing` 补显存；
+>   不是环境变量，训练环境直接用命令行传即可）。代码默认走 **BNSD 4 维布局**
+>   （可用 `--fa-layout bsh` 切回 3 维）。
+>   **自动降级**：`npu_fusion_attention` 是异步算子，若当前 CANN 环境没有它的
+>   kernel（如 `FlashAttentionScore does not has any binary`），错误只会在
+>   backward 等同步点爆发、try/except 捕获不到。因此训练前会做一次**同步探测**，
+>   不可用时自动禁用 FA 并回退手写 attention（日志打印 warning），不再崩溃；
+>   若用户未显式指定 checkpoint，还会自动恢复 gradient-checkpointing 防止 OOM；
 > - **gradient checkpointing**：NPU 默认开启；当用了 `--flash-attention` 时自动关闭
 >   （FA 省下的 HBM 足够，训练快 ~30%）。可随时用 `--gradient-checkpointing 1/0`
 >   显式覆盖；
