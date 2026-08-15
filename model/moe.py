@@ -238,17 +238,28 @@ class MoEBlock(nn.Module):
         top_probs, top_idx = torch.topk(probs, k=self.top_k, dim=-1)
         top_probs = top_probs.to(x.dtype)
 
-        y = torch.zeros_like(flat)
         top_idx = top_idx.view(-1, self.top_k)
         # NPU-safe routing: fixed-shape compute only.  No nonzero / index_add_ /
         # data-dependent control flow (both hang CANN graph compilation).
-        # Every expert runs on ALL tokens; the top-k weights gate its output
-        # (zero for non-routed experts), which is numerically identical to the
-        # sparse gather-add version but with statically-known shapes.
-        for e in range(self.n_experts):
-            mask = top_idx == e                                          # [S, k] bool, fixed shape
-            w = (mask.to(top_probs.dtype) * top_probs).sum(-1, keepdim=True)  # [S, 1]
-            y = y + self.experts[e](flat) * w
+        # All experts run on ALL tokens; the top-k weights gate their outputs.
+        # Per-expert Linear weights are concatenated into single [E*H, D] /
+        # [D, E*H] matrices so the whole expert layer is 3 fused matmuls
+        # instead of 16 sequential SwiGLU calls (much higher NPU utilization).
+        H = self.experts[0].mlp.gate.out_features
+        W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
+        W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
+        W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
+        S = flat.shape[0]
+        g_all = F.linear(flat, W_gate)                       # [S, E*H]
+        u_all = F.linear(flat, W_up)                         # [S, E*H]
+        g = g_all.view(S, self.n_experts, H)
+        u = u_all.view(S, self.n_experts, H)
+        a = F.silu(g) * u                                    # [S, E, H]
+        # top-k per-expert weight: [S, k, E] one-hot * top_probs -> [S, E]
+        onehot = F.one_hot(top_idx, num_classes=self.n_experts).to(top_probs.dtype)
+        w = (onehot * top_probs.unsqueeze(-1)).sum(dim=1)    # [S, E]
+        a = a * w.unsqueeze(-1)                              # [S, E, H]
+        y = F.linear(a.reshape(S, self.n_experts * H), W_down)  # [S, D]
         y = y.reshape(B, T, D)
 
         if self.n_shared_experts > 0:
