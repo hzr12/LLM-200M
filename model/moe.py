@@ -318,8 +318,10 @@ class MoETransformer(nn.Module):
         n_layers = len(self.layers)
         for layer in self.layers:
             if self.cfg.gradient_checkpointing and self.training:
+                # 直接把 layer 传给 checkpoint（nn.Module 可调用）。
+                # 不要用 lambda 包裹——闭包捕获循环变量在反向重算时会解析成最后一层。
                 x, ls = torch.utils.checkpoint.checkpoint(
-                    lambda x_, c_, s_, l=l: l(x_, c_, s_), x, cos, sin, use_reentrant=False)
+                    layer, x, cos, sin, use_reentrant=False)
             else:
                 x, ls = layer(x, cos, sin)
             for k in losses:
