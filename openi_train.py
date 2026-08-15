@@ -45,6 +45,37 @@ import sys
 from pathlib import Path
 
 
+# grampus.py / 启智平台注入的启动参数。这些参数只属于平台侧，
+# 必须过滤掉，绝不能透传给底层 train.py / sft_train.py（否则 argparse 报错）。
+_PLATFORM_ARGS = {
+    "multi_data_url", "pretrain_url", "train_url", "model_url", "code_url",
+    "boot_file", "code_name", "grampus_code_file_name", "grampus_code_url",
+    "grampus_model_file_name", "data_url", "openi_code_path", "openi_data_path",
+}
+
+
+def _filter_platform_args(args: list) -> list:
+    """从 grampus 透传的 unknown 参数里剔除平台注入项，保留用户训练参数。
+
+    支持两种形式：`--name=value` 和 `--name value`。
+    """
+    out = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0].lower()
+            if name in _PLATFORM_ARGS:
+                # --name=value 形式直接跳过；--name value 形式还需跳过下一个
+                if "=" not in a:
+                    skip_next = True
+                continue
+        out.append(a)
+    return out
+
+
 def resolve_c2net_ctx():
     """尝试初始化 C2NET。返回 context 对象，或 None（本地/未安装）。"""
     try:
@@ -119,7 +150,13 @@ def main():
         if init_from:
             cmd += ["--init-from", init_from]
 
-    cmd += unknown
+    # 透传前先剔除平台注入参数（grampus 会把 multi_data_url 等塞进 unknown）
+    forward = _filter_platform_args(unknown)
+    if forward != unknown:
+        print(f"[openi] filtered {len(unknown) - len(forward)} platform args "
+              f"({', '.join(_PLATFORM_ARGS & {a[2:].split('=', 1)[0] for a in unknown if a.startswith('--')}) or 'unknown'})",
+              flush=True)
+    cmd += forward
     print(f"[openi] cmd: {' '.join(shlex.quote(c) for c in cmd)}", flush=True)
 
     rc = 0
