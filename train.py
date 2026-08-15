@@ -162,7 +162,7 @@ def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _save_ckpt(out_dir, name: str, model, optim, step, cfg, loss=None, log=None):
+def _save_ckpt(out_dir, name: str, model, optim, step, cfg, scaler=None, loss=None, log=None):
     """保存单个 checkpoint 到 out_dir/name（覆盖写，避免累积）。"""
     path = out_dir / name
     torch.save({
@@ -170,6 +170,7 @@ def _save_ckpt(out_dir, name: str, model, optim, step, cfg, loss=None, log=None)
         "optim": optim.state_dict(),
         "step": step,
         "cfg": cfg.__dict__,
+        "scaler": scaler.state_dict() if scaler is not None else None,
         "loss": loss,
     }, path)
     msg = f"checkpoint saved -> {path}"
@@ -262,14 +263,17 @@ def main():
     # 没有 kernel，错误只会在 backward/拷贝等同步点爆发导致崩溃（try/except
     # 无法捕获）。这里训练前先探测一次，不可用则自动禁用 FA 并降级。
     if cfg.use_flash_attn and device.type == "npu":
-        if not model.check_flash_attn(device, device_lib.amp_dtype()):
+        if not model.check_flash_attn(device, device_lib.amp_dtype(), seq_len=args.ctx):
             print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
             cfg.use_flash_attn = False
-            # FA 失效后激活内存回到高占用：若用户未显式指定 checkpoint，
-            # 恢复 NPU 默认开启（避免慢速 attention + 关 checkpoint 导致 OOM）
-            if args.gradient_checkpointing is None:
+            # FA 失效后激活内存回到高占用，慢速 attention + 全量专家激活在
+            # NPU 32GB HBM 上几乎必然 OOM。因此即便用户显式传过
+            # --gradient-checkpointing 0（其前提是 FA 已省下激活内存）也强制
+            # 开启，避免训练中途 OOM 崩溃。
+            if not cfg.gradient_checkpointing:
                 cfg.gradient_checkpointing = True
-                print("note: re-enabling gradient-checkpointing (slow attention without FA)", flush=True)
+                print("note: forcing gradient-checkpointing=1 (slow attention without FA "
+                      "needs it to fit NPU HBM)", flush=True)
     nparams = count_parameters(model)
     print(f"trainable params: {nparams/1e6:.2f}M (cfg estimate {cfg.num_parameters()['total']/1e6:.1f}M)")
 
@@ -305,6 +309,9 @@ def main():
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
         step = ckpt["step"]
+        if scaler is not None and ckpt.get("scaler") is not None:
+            scaler.load_state_dict(ckpt["scaler"])
+            print(f"  restored GradScaler scale={ckpt['scaler']['scale'].item():.4e}")
         print(f"resumed from {args.init_from} at step {step}")
 
     tokens_per_step = args.batch_size * args.ctx
@@ -375,8 +382,16 @@ def main():
         if step % args.log_every == 0:
             elapsed = time.time() - t0
             tps = tokens_per_step * step / max(elapsed, 1e-6)
+            # 附上显存占用（进程内查询），便于判断慢速/崩溃是否由显存碎片或泄漏导致
+            mem = ""
+            if device.type == "npu":
+                mem = (f" | hbm {torch.npu.memory_allocated()/1e9:.2f}/"
+                       f"{torch.npu.memory_reserved()/1e9:.2f}G")
+            elif device.type == "cuda":
+                mem = (f" | hbm {torch.cuda.memory_allocated()/1e9:.2f}/"
+                       f"{torch.cuda.memory_reserved()/1e9:.2f}G")
             log(f"loss {running/max(1,n_running):.4f} | lr {optim.param_groups[0]['lr']:.2e} | "
-                f"{tps/1e6:.2f}M tok/s | {elapsed/60:.1f}min | {step}/{total_steps}")
+                f"{tps/1e6:.2f}M tok/s | {elapsed/60:.1f}min | {step}/{total_steps}{mem}")
             running, n_running = 0.0, 0
 
         if step % args.val_every == 0:
@@ -385,16 +400,16 @@ def main():
             if vloss < best_val:
                 best_val = vloss
                 _save_ckpt(out_dir, "ckpt_best.pt", model, optim, step, cfg,
-                           loss=vloss, log=log)
+                           scaler=scaler, loss=vloss, log=log)
                 log(f"new best val loss {vloss:.4f}")
 
         if step % args.save_every == 0:
             # 只保留最新的 last checkpoint，避免累积大量文件（云脑回传友好）
             _save_ckpt(out_dir, "ckpt_last.pt", model, optim, step, cfg,
-                       loss=running / max(1, n_running), log=log)
+                       scaler=scaler, loss=running / max(1, n_running), log=log)
 
     # final: last checkpoint 即训练终点，best 已在上面按需保存
-    _save_ckpt(out_dir, "ckpt_last.pt", model, optim, step, cfg, log=log)
+    _save_ckpt(out_dir, "ckpt_last.pt", model, optim, step, cfg, scaler=scaler, log=log)
     print(f"done. last checkpoint -> {out_dir / 'ckpt_last.pt'} (best -> {out_dir / 'ckpt_best.pt'})")
 
 

@@ -54,6 +54,42 @@ _PLATFORM_ARGS = {
 }
 
 
+def _disable_custom_transformer_opp():
+    """Ascend CANN RC/alpha 版的 custom_transformer 定制算子包规格残缺。
+
+    它只包含 flash_attention_score_grad（backward）kernel 且枚举的 shape 组合
+    极少，会优先于 built-in OPP 被加载，导致训练时 FlashAttentionScoreGrad
+    "Can not find kernel by tilingKey" / kernel pointer null 崩溃（forward 走
+    built-in 正常，backward 被这个残缺包劫持）。把该 vendor 目录移走（改名
+    .bak，幂等可逆），backward 即回落到 built-in 标准算子。
+
+    本函数幂等、可逆、失败不阻塞训练；在无 Ascend 组件的机器上自动跳过。
+    """
+    try:
+        import glob
+        toolkit = "/usr/local/Ascend/ascend-toolkit"
+        if not os.path.isdir(toolkit):
+            return
+        seen = set()
+        for cand in glob.glob(os.path.join(toolkit, "*", "opp", "vendors", "custom_transformer")):
+            rp = os.path.realpath(cand)  # 去重：latest 软链与实际版本目录
+            if rp in seen:
+                continue
+            seen.add(rp)
+            if not os.path.isdir(cand):
+                continue
+            bak = cand + ".bak"
+            if os.path.exists(bak):
+                print(f"[openi] Ascend custom_transformer OPP already disabled ({bak})", flush=True)
+                continue
+            os.rename(cand, bak)
+            print(f"[openi] disabled Ascend custom_transformer OPP vendor: {cand} -> {bak}\n"
+                  f"[openi]   FlashAttentionScoreGrad now falls back to built-in OPP", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[openi] warning: failed to disable custom_transformer OPP (non-fatal): {e}",
+              file=sys.stderr, flush=True)
+
+
 def _filter_platform_args(args: list) -> list:
     """从 grampus 透传的 unknown 参数里剔除平台注入项，保留用户训练参数。
 
@@ -87,6 +123,10 @@ def resolve_c2net_ctx():
 
 
 def main():
+    # 在启动底层训练脚本前，先绕过 Ascend CANN RC/alpha 版残缺的
+    # custom_transformer 算子包（见 _disable_custom_transformer_opp 注释）。
+    _disable_custom_transformer_opp()
+
     ap = argparse.ArgumentParser(description="OpenI 启智云脑 (C2NET) 训练入口")
     ap.add_argument("--mode", choices=["pretrain", "sft"], default="pretrain",
                     help="pretrain=预训练, sft=微调")

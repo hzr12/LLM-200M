@@ -102,24 +102,36 @@ class Attention(nn.Module):
         # removes one O(T^2) elementwise kernel per layer per micro-batch.
         self.register_buffer("_causal_bias", None, persistent=False)
 
-    def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype) -> bool:
+    def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype, seq_len: int = 8) -> bool:
         """Synchronously check whether npu_fusion_attention is usable.
 
         The real operator is ASYNC: if this CANN install has no kernel for it
         (e.g. "FlashAttentionScore does not has any binary"), the failure only
         surfaces at the next sync point (backward / copy), so a try/except
         around the call itself can never catch it and training crashes. We run
-        one small-shape probe + torch.npu.synchronize() up front and globally
-        disable FA on failure. Result is cached on the class.
+        one probe with the TRAINING sequence length (not a toy S=8 shape, whose
+        tilingKey never matches training) exercising BOTH forward and backward
+        + torch.npu.synchronize() up front and globally disable FA on failure.
+
+        The backward pass is mandatory: fp16 training dies in
+        FlashAttentionScoreGrad (backward kernel) long before forward shape
+        issues would, and some CANN builds ship forward but no backward
+        kernels. q/k/v must set requires_grad=True, otherwise autograd stops
+        at the attention op and never invokes the FA backward kernel, making
+        the probe a no-op for the exact failure we are guarding against.
+        Result is cached on the class.
         """
         if Attention._npu_fa_ok is not None:
             return Attention._npu_fa_ok
         try:
             import torch_npu
-            S = 8
-            q = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
-            k = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
-            v = torch.zeros(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device)
+            S = seq_len
+            q = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
+                            requires_grad=True)
+            k = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
+                            requires_grad=True)
+            v = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
+                            requires_grad=True)
             m = torch.triu(torch.ones(S, S, device=device, dtype=torch.bool),
                            diagonal=1).view(1, 1, S, S)
             layout = self.fa_layout.strip().lower()
@@ -134,6 +146,7 @@ class Attention(nn.Module):
                 y, *_ = torch_npu.npu_fusion_attention(
                     qh, kh, vh, self.n_heads, "BSH", atten_mask=m,
                     scale=self._scale, inner_precise=0)
+            y.sum().backward()  # must exercise FlashAttentionScoreGrad
             torch.npu.synchronize()
             Attention._npu_fa_ok = True
         except Exception as e:  # noqa: BLE001
@@ -142,7 +155,7 @@ class Attention(nn.Module):
                 Attention._npu_fa_warned = True
                 print(f"warning: npu_fusion_attention unavailable on this CANN install "
                       f"({e!r}); disabling FlashAttention, falling back to slow attention "
-                      f"(layout={self.fa_layout}, dtype={dtype})", flush=True)
+                      f"(layout={self.fa_layout}, seq_len={seq_len}, dtype={dtype})", flush=True)
         return Attention._npu_fa_ok
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -170,7 +183,7 @@ class Attention(nn.Module):
                 # does not has any binary），错误只会延迟到同步点爆发，try/except
                 # 无法捕获。因此首次调用先做一次小 shape 同步探测，失败则全局
                 # 禁用 FA 并回退下方慢速 attention。
-                if not self._npu_fa_probe(x.device, q.dtype):
+                if not self._npu_fa_probe(x.device, q.dtype, T):
                     pass  # fall through to slow attention below
                 else:
                     import torch_npu
@@ -422,16 +435,18 @@ class MoETransformer(nn.Module):
         for layer in self.layers:
             layer.refresh_expert_cache()
 
-    def check_flash_attn(self, device: torch.device, dtype: torch.dtype) -> bool:
+    def check_flash_attn(self, device: torch.device, dtype: torch.dtype,
+                         seq_len: int = 8) -> bool:
         """Pre-flight synchronous FA availability probe (Ascend only).
 
-        Call once after model.to(device) before training. Returns True if
-        npu_fusion_attention is usable; on failure it is globally disabled
-        inside the probe (falls back to slow attention) and this returns False.
+        Call once after model.to(device) before training, passing the real
+        training sequence length (--ctx). Probes forward AND backward with the
+        real tiling shape; on failure FA is globally disabled inside the probe
+        (falls back to slow attention) and this returns False.
         """
         if len(self.layers) == 0:
             return False
-        return self.layers[0].attn._npu_fa_probe(device, dtype)
+        return self.layers[0].attn._npu_fa_probe(device, dtype, seq_len)
 
     def _post_load_rebuild(self, module, incompatible_keys) -> None:
         """Called after load_state_dict finishes (all submodules loaded)."""
