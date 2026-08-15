@@ -1,0 +1,21 @@
+torch>=2.1
+# OpenI 启智云脑 (C2NET) 接入：仅在云脑训练任务中需要，本地可不装
+#   pip install c2net -i https://pypi.tuna.tsinghua.edu.cn/simple
+# c2net
+# --- Ascend 910 (NPU) 支持 ---
+# torch_npu 版本必须与 torch 严格匹配。本项目目标环境：CANN 8.0 + torch 2.1 + torch_npu 2.1.0
+#   pip install torch_npu==2.1.0 -i https://repo.huaweicloud.com/repository/pypi/simple
+# 或从 https://gitee.com/ascend/pytorch 源码编译。需配置 ASCEND_ROOT
+# （如 /usr/local/Ascend/ascend-toolkit/latest）。
+# 如无 NPU 用 torch>=2.5 + CUDA，请按需调整 torch 版本。
+# torch_npu
+# --- AMP 精度（可选）---
+# NPU 默认 bf16 autocast；若 bf16 报错/异常，启动命令设 LLM_SNN_AMP=fp16 切 fp16。
+sentencepiece>=0.2.0
+datasets>=3.0
+numpy>=1.26
+pyyaml>=6.0
+matplotlib>=3.8
+truststore>=0.9
+fastapi>=0.110
+uvicorn>=0.29
