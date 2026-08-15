@@ -149,6 +149,17 @@ def main():
     ], lr=args.lr, betas=(args.beta1, args.beta2), fused=device_lib.optimizer_fused(device))
     print(f"optimizer: {len(decay)} decay tensors, {len(no_decay)} no-decay tensors")
 
+    # fp16 训练必须配 GradScaler（防梯度下溢/溢出）；bf16 不需要。
+    # NPU 用 torch_npu 的 GradScaler，CUDA 用 torch.cuda.amp.GradScaler。
+    scaler = None
+    if device_lib.amp_dtype() == torch.float16:
+        try:
+            from torch.npu.amp import GradScaler
+        except ImportError:
+            from torch.cuda.amp import GradScaler
+        scaler = GradScaler()
+        print("using GradScaler (LLM_SNN_AMP=fp16)")
+
     step = 0
     if args.init_from:
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
@@ -193,15 +204,24 @@ def main():
             with device_lib.amp_context(device):
                 _, losses_d = model(x, y)
                 loss = losses_d["total"] / grad_accum
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             running += loss.item() * grad_accum
             n_running += 1
 
         # gradient clipping + step
+        if scaler is not None:
+            scaler.unscale_(optim)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         for g in optim.param_groups:
             g["lr"] = lr_at(step)
-        optim.step()
+        if scaler is not None:
+            scaler.step(optim)
+            scaler.update()
+        else:
+            optim.step()
         optim.zero_grad(set_to_none=True)
         step += 1
 
