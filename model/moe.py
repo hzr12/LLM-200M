@@ -116,10 +116,13 @@ class Attention(nn.Module):
                         torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
                     self._npu_mask = m.view(1, 1, T, T)
                 atten_mask = self._npu_mask[..., :T, :T]
-                # q,k,v: [B, n_heads, T, D] -> [B, T, n_heads, D] (BSH 布局)
-                qh = q.transpose(1, 2).contiguous()
-                kh = k.transpose(1, 2).contiguous()
-                vh = v.transpose(1, 2).contiguous()
+                # npu_fusion_attention 的 "BSH" 布局要求 q/k/v 为 3 维
+                # [B, S, H]，H = n_heads*head_dim（所有 head 展平拼接）。
+                # q/k/v 当前是 [B, n_heads, T, D] -> transpose 后 [B, T, n_heads, D]，
+                # 需再展平最后一维成 [B, T, n_heads*D]。
+                qh = q.transpose(1, 2).reshape(B, T, -1).contiguous()
+                kh = k.transpose(1, 2).reshape(B, T, -1).contiguous()
+                vh = v.transpose(1, 2).reshape(B, T, -1).contiguous()
                 y, *_ = torch_npu.npu_fusion_attention(
                     qh, kh, vh, self.n_heads, "BSH",
                     atten_mask=atten_mask,
