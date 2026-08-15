@@ -126,8 +126,13 @@ class Attention(nn.Module):
                     scale=self.head_dim ** -0.5,
                     inner_precise=0)
                 return self.o_proj(y.reshape(B, T, -1))
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            # fallback: 慢速 fp32/bf16 attention（[B, h, T, T] 大矩阵，显存大）
+            # 在 NPU 上打印一次警告，便于排查 FA 未命中的原因
+            if dev_type == "npu" and not getattr(self, "_fa_warned", False):
+                self._fa_warned = True
+                print(f"warning: npu_fusion_attention failed ({e!r}); "
+                      f"falling back to slow attention (q.dtype={q.dtype})", flush=True)
         att = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         att = att.masked_fill(
             torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1),

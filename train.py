@@ -100,8 +100,9 @@ def main():
     # model
     ap.add_argument("--config", default="moe-200m")
     ap.add_argument("--init-from", default=None, help="checkpoint to resume from")
-    ap.add_argument("--gradient-checkpointing", action="store_true",
-                    help="激活重计算，省显存（训练变慢 ~30%）。32GB 显存且 micro-batch 大时建议开启")
+    ap.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=None,
+                    help="激活重计算，省显存（训练变慢 ~30%）。NPU 上默认开启（32GB HBM + 全量专家激活容易 OOM）；"
+                         "CUDA/CPU 默认关闭。用 --no-gradient-checkpointing 显式关闭")
     # run
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
@@ -114,6 +115,14 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     device = device_lib.get_device()
+
+    # NPU 默认开启 gradient checkpointing：全量专家激活很大，32GB HBM 容易 OOM。
+    # 用户可用 --no-gradient-checkpointing 显式关闭（CUDA/CPU 不受影响，默认关）。
+    if args.gradient_checkpointing is None:
+        args.gradient_checkpointing = (device.type == "npu")
+        if args.gradient_checkpointing:
+            print("device is NPU: gradient-checkpointing enabled by default "
+                  "(pass --no-gradient-checkpointing to disable)")
 
     data_dir = Path(args.data_dir)
     train_mmap = np.memmap(data_dir / "train.bin", dtype=np.uint16, mode="r")

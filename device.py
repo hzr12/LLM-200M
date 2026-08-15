@@ -18,24 +18,38 @@ import os
 import torch
 
 # AMP 精度选择：环境变量 LLM_SNN_AMP ∈ {"bf16", "fp16"}
-# - 默认 bf16：与原设计一致，无需 loss scaling，torch_npu 2.1 + CANN8 的
-#   npu_fusion_attention 原生支持 bf16。
-# - fp16：CANN/torch_npu 早期版本对 bf16 支持不稳时使用；注意 fp16 训练需
-#   配合 GradScaler 防止梯度下溢/溢出（当前脚本未内置 scaler，请谨慎启用）。
-_AMP_DTYPE = torch.bfloat16 if os.environ.get("LLM_SNN_AMP", "bf16").lower() == "bf16" \
-    else torch.float16
-
-
-def amp_dtype() -> torch.dtype:
-    return _AMP_DTYPE
-
-
+# - 默认 bf16：与原设计一致（CUDA），无需 loss scaling。
+# - fp16：NPU 首选。torch_npu 2.1 的 autocast 不支持 bf16（会被静默禁用，
+#   导致全模型 fp32 计算，显存翻倍、吞吐暴跌）。因此 NPU 上若未显式设置
+#   LLM_SNN_AMP，自动降级为 fp16，并由 train.py 自动启用 GradScaler。
 def is_npu_available() -> bool:
     try:
         import torch_npu  # noqa: F401
         return torch.npu.is_available()
     except (ImportError, AttributeError, RuntimeError):
         return False
+
+
+def _pick_amp_dtype() -> torch.dtype:
+    v = os.environ.get("LLM_SNN_AMP", "").strip().lower()
+    if v in ("fp16", "float16"):
+        return torch.float16
+    if v in ("bf16", "bfloat16"):
+        return torch.bfloat16
+    # 未显式指定：
+    if is_npu_available():
+        print("note: LLM_SNN_AMP unset on NPU -> using fp16 "
+              "(bf16 autocast unsupported by torch_npu 2.1; "
+              "train.py auto-enables GradScaler)", flush=True)
+        return torch.float16
+    return torch.bfloat16
+
+
+_AMP_DTYPE = _pick_amp_dtype()
+
+
+def amp_dtype() -> torch.dtype:
+    return _AMP_DTYPE
 
 
 def is_cuda_available() -> bool:
