@@ -53,6 +53,12 @@ _PLATFORM_ARGS = {
     "grampus_model_file_name", "data_url", "openi_code_path", "openi_data_path",
 }
 
+# 在启动底层训练前设置 CUDA/NPU 显存分配器策略，缓解变长 shape 导致的
+# 碎片化（reserved 持续膨胀直至 OOM）。expandable_segments 允许分配器按需
+# 扩展段，对 grouped-GEMM/逐专家 MoE 的变长中间张量更友好。此环境变量由
+# 本进程注入，子进程（train.py）自动继承，无需用户手动配置。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 
 def _disable_custom_transformer_opp():
     """Ascend CANN RC/alpha 版的 custom_transformer 定制算子包规格残缺。

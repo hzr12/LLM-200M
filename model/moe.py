@@ -298,6 +298,10 @@ class MoEBlock(nn.Module):
         # fused per-expert weight matrices (W_gate/W_up/W_down), rebuilt after
         # every optimizer step instead of cat()-ing them each forward call.
         self._expert_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # sparse grouped-GEMM 的固定 padded 容量（首次见到 S 时计算并缓存，
+        # 避免每步 N_max 变化导致 allocator 碎片化 OOM）。
+        self._n_cap: int | None = None
+        self._n_cap_s: int = -1
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.norm1(x), cos, sin)
@@ -366,26 +370,37 @@ class MoEBlock(nn.Module):
         flat_idx = top_idx.reshape(-1)                       # [S*k]
         flat_probs = top_probs.reshape(-1)                   # [S*k]
         token_ids = torch.arange(S, device=device).repeat_interleave(k)  # [S*k]
-        order = torch.argsort(flat_idx, stable=True)
-        sorted_experts = flat_idx[order]                     # [S*k]
+        # 用 torch.sort 而非 argsort(stable=True)：后者在 NPU 上不受支持，
+        # 会回退 CPU 执行导致每层每步 GPU<->CPU 同步。稳定性对本算法不是
+        # 必需——每 token-expert 对的槽位唯一性由 counts/pos 保证，与段内
+        # 顺序无关；sorted_* 都按同一 order 重排，保持一致。
+        sorted_experts, order = torch.sort(flat_idx)         # 值 + 索引
         sorted_probs = flat_probs[order]                     # [S*k]
         sorted_token_ids = token_ids[order]                  # [S*k]
 
         # --- 每专家 token 数 / 段内偏移（仅一次 .item() 同步）---
         counts = torch.bincount(sorted_experts, minlength=E)  # [E]
-        N_max = int(counts.max().item())
         offsets = torch.cumsum(counts, 0) - counts            # [E] 每段起始
         arange = torch.arange(S * k, device=device)
         seg_start = torch.repeat_interleave(offsets, counts)  # [S*k]
         pos = arange - seg_start                              # [S*k] 段内位置
 
-        # --- 构造 padded 输入 [E, N_max, D] / [E, N_max] ---
+        # --- padded 容量固定为 S（每专家理论上限）---
+        # top-2 下单个专家最多被 S 个 token 选中（S 个 token 全部路由到同一
+        # 专家），不会超过 S。固定用 S 作为容量：padded shape 恒定为
+        # [E, S, D]，allocator 稳定复用；训练早期 router 坍缩也不会越界。
+        if self._n_cap_s != S:
+            self._n_cap = S
+            self._n_cap_s = S
+        n_cap = S if self._n_cap is None else self._n_cap
+
+        # --- 构造 padded 输入 [E, n_cap, D] / [E, n_cap]（shape 恒定）---
         sorted_tokens = flat[sorted_token_ids]                # [S*k, D]
         padded = torch.index_put(
-            torch.zeros(E, N_max, D, dtype=dtype, device=device),
+            torch.zeros(E, n_cap, D, dtype=dtype, device=device),
             (sorted_experts, pos), sorted_tokens)
         padded_probs = torch.index_put(
-            torch.zeros(E, N_max, dtype=dtype, device=device),
+            torch.zeros(E, n_cap, dtype=dtype, device=device),
             (sorted_experts, pos), sorted_probs)
 
         # --- grouped GEMM（3 次 bmm，autocast 下自动 bf16/fp16 计算）---
