@@ -17,22 +17,22 @@ import os
 
 import torch
 
-# AMP 精度选择：环境变量 LLM_SNN_AMP ∈ {"fp16", "bf16"}
-# - 默认 fp16：训练显存小、NPU/CUDA 均稳定支持，train.py 会自动启用
-#   GradScaler 防止梯度下溢/溢出（本设计当前默认）。
-# - bf16：仅当显式设置 LLM_SNN_AMP=bf16 时使用。注意 torch_npu 2.1 的
-#   autocast 不支持 bf16（会被静默禁用导致全模型 fp32 计算），故 NPU 上
-#   不推荐。
+# AMP 精度选择：环境变量 LLM_SNN_AMP ∈ {"fp16", "bf16"}（默认 fp16）
+#
+# 硬件上 Ascend910ProA 的 Cube 单元原生支持 bf16，但实测在 CANN 8 +
+# torch_npu 2.1.0 环境下 bf16 autocast 无法使用（算子不支持/回退 Vector），
+# 故默认回退为 fp16。fp16 需配套 GradScaler（见 train.py 的
+# torch.npu.amp.GradScaler），防梯度下溢/溢出。
+#
+# 仅当显式 LLM_SNN_AMP=bf16 且环境确实支持时使用 bf16（免 GradScaler）。
+# CUDA 上两者皆可，默认走 fp16 以保证与本仓库 NPU 路径一致。
 def _pick_amp_dtype() -> torch.dtype:
     v = os.environ.get("LLM_SNN_AMP", "").strip().lower()
-    if v in ("fp16", "float16"):
-        return torch.float16
     if v in ("bf16", "bfloat16"):
         return torch.bfloat16
-    # 未显式指定：默认 fp16（全局）
-    print("note: LLM_SNN_AMP unset -> defaulting to fp16 "
-          "(train.py auto-enables GradScaler; set LLM_SNN_AMP=bf16 to override)",
-          flush=True)
+    if v in ("fp16", "float16"):
+        return torch.float16
+    # 未显式指定：默认 fp16（CANN 8 + torch_npu 2.1 环境下 bf16 不可用）
     return torch.float16
 
 
@@ -72,11 +72,27 @@ def is_npu(device: torch.device | str = None) -> bool:
 def amp_context(device: torch.device | str):
     """Return an autocast context; dtype follows LLM_SNN_AMP (default fp16).
 
-    torch_npu 2.1 的 autocast 不支持 bf16，故默认使用 fp16；bf16 需显式
-    设 `LLM_SNN_AMP=bf16`（仅推荐 CUDA 上使用）。fp16 模式下 train.py
-    会自动配合 GradScaler。
+    CANN 8 + torch_npu 2.1.0 环境下 bf16 autocast 不可用，故默认 fp16；
+    bf16 模式需显式设 `LLM_SNN_AMP=bf16` 且环境确实支持（否则回退慢路径）。
+    fp16 下 train.py 自动配合 GradScaler。
     """
     return amp_context_dtype(device, _AMP_DTYPE)
+
+
+def init_npu() -> None:
+    """NPU 一次性初始化：开启 JIT 编译缓存，降低首步编译台阶。
+
+    Ascend910ProA 上 CANN 对每个新 (算子, shape) 首次执行会编译二进制落盘。
+    开启 jit_compile 后编译产物缓存复用，避免用户观察到的"前 10 分钟编译"
+    卡顿；同时启用算子在线编译（CANN 8 默认已带，此处确保开启）。
+    """
+    if not is_npu_available():
+        return
+    try:
+        torch.npu.set_compile_mode(jit_compile=True)
+    except Exception:  # noqa: BLE001
+        pass  # 老版本 torch_npu 无此 API，忽略不影响功能
+    # 若使用确定性/性能模式可在此设置；910B 默认性能优先，无需额外配置。
 
 
 def amp_context_dtype(device: torch.device | str, dtype):

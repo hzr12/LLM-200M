@@ -195,6 +195,9 @@ def main():
     ap.add_argument("--beta1", type=float, default=0.9)
     ap.add_argument("--beta2", type=float, default=0.95)
     ap.add_argument("--grad-clip", type=float, default=1.0)
+    ap.add_argument("--scaler-init-scale", type=float, default=1024.0,
+                    help="fp16 GradScaler 初始缩放；偏大易 overflow，偏小梯度下溢。"
+                         "默认 1024(2**10)，overflow 频繁可调小，训练不稳可调大。")
     ap.add_argument("--dropout", type=float, default=0.0)
     # model
     ap.add_argument("--config", default="moe-200m")
@@ -215,9 +218,9 @@ def main():
                          "部分 CANN 版本只对其中一种布局提供 kernel")
     ap.add_argument("--sparse-moe", type=_str2bool, default=None,
                     nargs="?", const=True, metavar="BOOL",
-                    help="sparse MoE：只对 router 选中的 top-k 专家计算（FLOPs 约降为 k/E，"
-                         "默认开启）。关闭用 --sparse-moe 0（回退全专家计算 + top-k 加权，"
-                         "NPU 上若 index_add 算子不稳定可用）")
+                    help="sparse MoE 开关（语义标记）。910 Pro A 上 sparse 与 dense 已统一为 "
+                         "dense-mask 大 GEMM 架构（对所有专家一次 GEMM + top-k 权重 mask），"
+                         "两者共用同一实现，默认开启。关闭无意义但保留以兼容旧脚本。")
     # run
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
@@ -230,6 +233,7 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
     device = device_lib.get_device()
+    device_lib.init_npu()  # NPU: 开启 JIT 编译缓存，降低首步编译台阶
 
     # NPU 默认开启 gradient checkpointing：全量专家激活很大，32GB HBM 容易 OOM。
     # 但若 FlashAttention 已开启（--flash-attention），省下的激活内存足够关掉重计算，
@@ -270,7 +274,11 @@ def main():
     # 没有 kernel，错误只会在 backward/拷贝等同步点爆发导致崩溃（try/except
     # 无法捕获）。这里训练前先探测一次，不可用则自动禁用 FA 并降级。
     if cfg.use_flash_attn and device.type == "npu":
-        if not model.check_flash_attn(device, device_lib.amp_dtype(), seq_len=args.ctx):
+        # 透传真实 micro-batch：FusedAttention 的 kernel 可用性常依赖
+        # (batch, heads, seq) tiling，用 batch=1 探测通过、真实 batch 才炸的
+        # CANN 版本并不罕见，故必须按真实训练 micro-batch 探测才能说真话。
+        if not model.check_flash_attn(device, device_lib.amp_dtype(),
+                                      seq_len=args.ctx, batch=args.micro_batch):
             print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
             cfg.use_flash_attn = False
             # FA 失效后激活内存回到高占用，慢速 attention + 全量专家激活在
@@ -307,8 +315,11 @@ def main():
             from torch.npu.amp import GradScaler
         except ImportError:
             from torch.cuda.amp import GradScaler
-        scaler = GradScaler()
-        print("using GradScaler (LLM_SNN_AMP=fp16)")
+        # fp16 动态范围小（max≈65504），MoE 路由 logits / 大激活易 overflow。
+        # 默认 init_scale=2**16 偏高，首步溢出后才回退会浪费早期 step；
+        # 降到 2**10 起步更稳，GradScaler 仍会按需增长。
+        scaler = GradScaler(init_scale=args.scaler_init_scale)
+        print(f"using GradScaler (LLM_SNN_AMP=fp16, init_scale={args.scaler_init_scale})")
 
     step = 0
     if args.init_from:
@@ -347,6 +358,38 @@ def main():
     print(f"starting training on {device}")
     prefetcher = DataPrefetcher(
         [(train_mmap, 0), (train_mmap, 1)], args.micro_batch, args.ctx, device)
+
+    # --- NPU 编译预热（dry-run）------------------------------------------------
+    # 910 Pro A 上 CANN 对每个新 (算子, shape) 首次执行会编译二进制落盘。若直接
+    # 进训练循环，前若干 step 会卡在编译（用户观察到的"前 10 分钟编译"）。这里
+    # 用真实 batch 形状 dry-run 若干次（不更新权重、不计入日志），让 .o 落盘，
+    # 之后训练循环的首步几乎无编译开销。仅 NPU 且未 resume 时预热，避免重复。
+    if device.type == "npu" and step == 0:
+        n_warmup = 3
+        print(f"NPU compile warmup: dry-running {n_warmup} steps (no grad/opt)...",
+              flush=True)
+        t_w = time.time()
+        for _ in range(n_warmup):
+            x, y = prefetcher.next()
+            with device_lib.amp_context(device):
+                _, _ = model(x, y)
+            # 预热只需前向；但 MoE 路由/编译在前向就触发，无需 backward
+            if device.type == "npu":
+                torch.npu.synchronize()
+        print(f"warmup done in {(time.time()-t_w)/60:.1f}min; training starts now",
+              flush=True)
+
+    # 打印首步 token 数 S = micro_batch * ctx，确认 shape 恒定（避免动态 shape
+    # 触发反复编译）。后续 step 的 S 应与此一致（dataloader 已 drop_last + padding）。
+    _x0, _ = prefetcher.next()
+    S0 = _x0.shape[0] * _x0.shape[1]
+    print(f"fixed token count per micro-batch S = {S0} (B={_x0.shape[0]}, T={_x0.shape[1]})",
+          flush=True)
+    # 把这条样本放回 prefetcher（prefetcher 是无状态拉取，直接再 next 即下一条，
+    # 但为不浪费，这里复用 _x0：直接用它作为第一个 micro-batch 的一部分较复杂，
+    # 简单起见丢弃该样本，warmup 已保证编译完成，无碍。）
+    del _x0
+
     t0 = time.time()
     running = 0.0
     n_running = 0

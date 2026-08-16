@@ -138,7 +138,8 @@ def main():
     # 没有 kernel 会在同步点异步崩溃（try/except 捕获不到）。训练前探测一次，
     # 不可用则自动禁用 FA 并降级慢速 attention。
     if cfg.use_flash_attn and device.type == "npu":
-        if not model.check_flash_attn(device, device_lib.amp_dtype()):
+        if not model.check_flash_attn(device, device_lib.amp_dtype(),
+                                      seq_len=args.ctx, batch=args.micro_batch):
             print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
             cfg.use_flash_attn = False
     print(f"loaded pretrained weights from {args.init_from} (pretrain step {ckpt.get('step')})")

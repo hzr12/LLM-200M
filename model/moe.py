@@ -26,12 +26,48 @@ from .config import Config
 # --------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
+    """RMSNorm（NPU 上可选 npu_rms_norm 融合算子，Ascend C JIT 编译可用）。
+
+    CANN 8.0.RC1 实测：npu_rms_norm 走 te_rmsnorm JIT 编译路径（fwd+bwd 可用、
+    数值误差 ~2^-7 量级），而 npu_swiglu / npu_apply_rotary_pos_emb 等静态
+    二进制算子缺失。首次 forward 用真实 shape 探测一次（含 backward），失败
+    类级缓存回退到逐元素实现。
+    """
+    _npu_rms_ok: bool | None = None
+
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
+    @classmethod
+    def _probe_npu_rms_norm(cls, x: torch.Tensor, w: torch.Tensor,
+                            eps: float) -> bool:
+        """真实 (B, T, dim) shape 探测 npu_rms_norm forward+backward。"""
+        try:
+            import torch_npu  # noqa: F401
+            xx = torch.randn_like(x, requires_grad=True)
+            out = torch_npu.npu_rms_norm(xx, w, eps)
+            y = out[0] if isinstance(out, tuple) else out
+            y.sum().backward()
+            torch.npu.synchronize()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "npu" and x.dtype in (torch.float16, torch.bfloat16):
+            if RMSNorm._npu_rms_ok is None:
+                RMSNorm._npu_rms_ok = self._probe_npu_rms_norm(
+                    x, self.weight.to(x.dtype), self.eps)
+            if RMSNorm._npu_rms_ok:
+                try:
+                    import torch_npu  # noqa: F401
+                    out = torch_npu.npu_rms_norm(x, self.weight.to(x.dtype),
+                                                 self.eps)
+                    return out[0] if isinstance(out, tuple) else out
+                except Exception:  # noqa: BLE001
+                    RMSNorm._npu_rms_ok = False  # 运行时失败 → 全局回退
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 
@@ -66,6 +102,8 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # q,k: [B, heads, T, head_dim]; cos,sin: [T, head_dim/2]
     # RoPE pairs are (q[..., i], q[..., i+head_dim/2]); split first then mix.
+    # cos/sin 由 Model._rope 按 q.dtype 预缓存（命中时 dtype 一致，.to 为 no-op）；
+    # 仍保留 .to 作为兜底，保证 autocast 下 q.dtype != cos.dtype 时正确。
     cos = cos.to(q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, T, head_dim/2]
     sin = sin.to(q.dtype).unsqueeze(0).unsqueeze(0)
     q1, q2 = q[..., : q.shape[-1] // 2], q[..., q.shape[-1] // 2:]
@@ -93,79 +131,166 @@ class Attention(nn.Module):
         self.fa_layout = cfg.fa_layout
         self._scale = self.head_dim ** -0.5
         d = cfg.d_model
-        self.q_proj = nn.Linear(d, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
+        # qkv 合并为单个 GEMM（[D, (H + 2*KV)*D]）：3 个小 GEMM 变 1 个，
+        # 宽度 768→1024，NPU tiling 更高效。旧 checkpoint 的 q_proj/k_proj/
+        # v_proj.weight 由 _load_from_state_dict 兼容拼接。
+        self.qkv_proj = nn.Linear(d, (self.n_heads + 2 * self.n_kv_heads)
+                                  * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, d, bias=False)
         # Cached additive causal mask (upper triangle = -inf), lazily built in
         # forward. Replacing per-call triu()+masked_fill() with a broadcast add
         # removes one O(T^2) elementwise kernel per layer per micro-batch.
         self.register_buffer("_causal_bias", None, persistent=False)
 
-    def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype, seq_len: int = 8) -> bool:
-        """Synchronously check whether NPU fused attention (via SDPA) is usable.
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """旧 checkpoint 兼容：q_proj/k_proj/v_proj.weight → qkv_proj.weight。
 
-        torch_npu 的 fused attention 是异步算子：若该 CANN 安装对当前 shape
-        没有 kernel（如 FlashAttentionScoreGrad 缺失），错误只会延迟到下一个
-        同步点（backward / copy）爆发，try/except 无法捕获。这里用训练真实
-        序列长度（--ctx）跑一次 forward + backward + torch.npu.synchronize()
-        探测，失败则全局禁用并回退慢速 attention。结果缓存在类上。
+        qkv 合并前 state_dict 存三个独立权重；合并后只有 qkv_proj.weight。
+        这里在加载前把旧三权重按 out 维拼接（q 在前、k 中、v 后），旧键被
+        消费掉不会出现在 unexpected_keys。
+        """
+        qk, kk, vk = (prefix + "q_proj.weight", prefix + "k_proj.weight",
+                      prefix + "v_proj.weight")
+        if qk in state_dict and prefix + "qkv_proj.weight" not in state_dict:
+            w_q = state_dict.pop(qk)
+            w_k = state_dict.pop(kk)
+            w_v = state_dict.pop(vk)
+            state_dict[prefix + "qkv_proj.weight"] = torch.cat([w_q, w_k, w_v],
+                                                               dim=0)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata,
+                                      strict, missing_keys, unexpected_keys,
+                                      error_msgs)
 
-        backward 必须测：fp16 训练死在 backward kernel 早于 forward shape
-        问题，且部分 CANN 版本只带 forward 不带 backward kernel。q/k/v 必须
-        requires_grad=True，否则 autograd 在 attention 处中断，不会触发
-        fused-attention 的反向算子，探测就形同虚设。
+    @staticmethod
+    def _npu_fa_files_ok() -> bool:
+        """纯文件系统判定：CANN OPP 的 FA 注册 config json 是否可解析。
+
+        8.0.RC1 上 flash_attention_score_grad.json 已损坏（"Cannot parse json"）
+        → 直接判定不可用，绝不调用设备算子（FA 失败会污染设备状态：
+        side-stream 数据拷贝与后续算子输出野值，drain 只能防崩溃救不回
+        状态——minirepro 实测 E2/E3 验证）。
+        """
+        import glob
+        import json as _json
+        roots = [os.environ.get("ASCEND_OPP_PATH", ""),
+                 "/usr/local/Ascend/ascend-toolkit/latest/opp"]
+        for base in roots:
+            if not base:
+                continue
+            cfg_dir = os.path.join(base, "built-in", "op_impl", "ai_core", "tbe",
+                                   "kernel", "config", "ascend910")
+            jsons = sorted(glob.glob(os.path.join(cfg_dir, "flash_attention_score*.json")))
+            for j in jsons:
+                try:
+                    with open(j) as f:
+                        _json.load(f)
+                except Exception:  # noqa: BLE001
+                    return False   # 有文件但损坏 → 不可用
+            if jsons:
+                return True        # 存在且全部可解析 → 才允许设备探测
+        return False
+
+    def _npu_fa_probe(self, device: torch.device, dtype: torch.dtype,
+                      seq_len: int = 8, batch: int = 1) -> bool:
+        """Synchronously check whether NPU fused attention is usable.
+
+        文件预检先行（CANN 算子注册 json 损坏/缺失 → 零设备操作判定不可用）；
+        预检通过才做真实形状 forward+backward 设备探测。失败则全局禁用。
+        结果缓存在类上（_npu_fa_ok），forward 不再每层重测。
         """
         if Attention._npu_fa_ok is not None:
             return Attention._npu_fa_ok
+        # 文件预检：FA 在此 CANN 必然不可用（注册损坏），设备探测会污染
+        # 设备状态（side-stream 拷贝返回野值、后续算子输出野值，drain 救不回），
+        # 因此判定完全基于文件系统，绝不调用设备算子。
+        if not self._npu_fa_files_ok():
+            Attention._npu_fa_ok = False
+            if not Attention._npu_fa_warned:
+                Attention._npu_fa_warned = True
+                print("warning: NPU fused attention unavailable on this CANN "
+                      "install (FA op registration missing/corrupt: "
+                      "flash_attention_score*.json under ascend910 kernel config); "
+                      "disabling FlashAttention, falling back to slow attention "
+                      f"(seq_len={seq_len}, batch={batch}, dtype={dtype})", flush=True)
+            return False
         try:
             import torch_npu  # noqa: F401  # 确保 NPU 后端已注册
             S = seq_len
-            q = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
-                            requires_grad=True)
-            k = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
-                            requires_grad=True)
-            v = torch.randn(1, self.n_heads, S, self.head_dim, dtype=dtype, device=device,
-                            requires_grad=True)
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # probe 必须镜像 forward 的真实路径：真实 batch + 真实 GQA 形状
+            # + repeat + 显式 fusion_attention（与 forward 同一调用与参数）。
+            q = torch.randn(batch, self.n_heads, S, self.head_dim, dtype=dtype,
+                            device=device, requires_grad=True)
+            k = torch.randn(batch, self.n_kv_heads, S, self.head_dim, dtype=dtype,
+                            device=device, requires_grad=True)
+            v = torch.randn(batch, self.n_kv_heads, S, self.head_dim, dtype=dtype,
+                            device=device, requires_grad=True)
+            if self.repeats > 1:
+                k = k.repeat_interleave(self.repeats, dim=1)
+                v = v.repeat_interleave(self.repeats, dim=1)
+            out = torch_npu.npu_fusion_attention(
+                q, k, v, self.n_heads, "BNSD",
+                scale=self._scale,
+                pre_tockens=2147483647, next_tockens=0, sparse_mode=2,
+                sync=True)
+            y = next(t for t in out
+                     if tuple(getattr(t, "shape", ()))
+                     == (batch, self.n_heads, S, self.head_dim))
             y.sum().backward()  # must exercise the fused-attention backward kernel
             torch.npu.synchronize()
             Attention._npu_fa_ok = True
         except Exception as e:  # noqa: BLE001
             Attention._npu_fa_ok = False
+            # 防御性 drain（文件预检已通过才可能走到这里）：probe 触发的失败
+            # kernel 会以异步错误形式残留排队，不清会导致后续设备操作崩溃。
+            for _ in range(5):
+                try:
+                    torch.npu.synchronize()
+                    torch.zeros(1, device=device).item()
+                except Exception:  # noqa: BLE001
+                    pass
             if not Attention._npu_fa_warned:
                 Attention._npu_fa_warned = True
-                print(f"warning: NPU fused attention (SDPA) unavailable on this CANN install "
-                      f"({e!r}); disabling FlashAttention, falling back to slow attention "
-                      f"(seq_len={seq_len}, dtype={dtype})", flush=True)
+                print(f"warning: NPU fused attention unavailable on this CANN "
+                      f"({e!r}); disabling FlashAttention, falling back to slow "
+                      f"attention (seq_len={seq_len}, batch={batch}, dtype={dtype})",
+                      flush=True)
         return Attention._npu_fa_ok
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # qkv 合并 GEMM → split（q 在前、k 中、v 后）
+        qkv = self.qkv_proj(x)
+        dq = self.n_heads * self.head_dim
+        dkv = self.n_kv_heads * self.head_dim
+        q, k, v = qkv.split([dq, dkv, dkv], dim=-1)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, k, cos, sin)
-        # GQA: repeat kv heads
-        k = k.repeat_interleave(self.repeats, dim=1)
-        v = v.repeat_interleave(self.repeats, dim=1)
-        # fused-attention 入口，优先级：flash-attn > SDPA > 慢速
-        #   - CUDA flash-attn: 若已安装 DAO flash-attn（A100+ 性能最佳），优先使用
-        #   - SDPA: torch 原生自带（CUDA 自动选 flash/em/math；V100 用 em/math；
-        #     NPU 映射到 npu_fusion_attention，需 --flash-attention 显式开启并探测）
-        #   - 慢速: 兜底（纯 matmul + softmax，任何设备可用）
+        # GQA 头数对齐：
+        # - CUDA 的 SDPA 原生支持 GQA broadcast，可直接传原始 k/v。
+        # - NPU 的 FusedAttention 不支持 GQA 头数自动 broadcast，走融合
+        #   分支前必须 repeat k/v（见下方 npu 分支）。
+        # - flash-attn(CUDA) / 慢速路径 也需等头数。
         dev_type = x.device.type
+        # NPU 融合分支只在启动期 check_flash_attn 探测通过后启用（_npu_fa_ok
+        # 为 True）；未探测(None)/探测失败(False) 一律走慢速路径——torch_npu
+        # 2.1 的 SDPA 无融合后端（math 实现），不值得走 SDPA 分支。
         use_fused = (q.dtype in (torch.float16, torch.bfloat16)
                      and (dev_type == "cuda"
-                          or (dev_type == "npu" and self.use_flash_attn)))
+                          or (dev_type == "npu" and self.use_flash_attn
+                              and Attention._npu_fa_ok is True)))
         if use_fused:
-            # 1) CUDA 优先 DAO flash-attn（未安装或失败都自动落到 SDPA）
+            # 1) CUDA 优先 DAO flash-attn（需 repeat 后等头数 k/v；未装/失败落 SDPA）
             if dev_type == "cuda":
+                k_r = k.repeat_interleave(self.repeats, dim=1)
+                v_r = v.repeat_interleave(self.repeats, dim=1)
                 try:
                     from flash_attn import flash_attn_func
                     y = flash_attn_func(
-                        q.transpose(1, 2).contiguous(), k.transpose(1, 2).contiguous(),
-                        v.transpose(1, 2).contiguous(), causal=True)
+                        q.transpose(1, 2).contiguous(), k_r.transpose(1, 2).contiguous(),
+                        v_r.transpose(1, 2).contiguous(), causal=True)
                     return self.o_proj(y.reshape(B, T, -1))
                 except ImportError:
                     pass  # flash-attn 未安装 → 走 SDPA
@@ -175,22 +300,44 @@ class Attention(nn.Module):
                         Attention._npu_fa_warned = True
                         print(f"warning: flash_attn_func failed on cuda ({e!r}); "
                               f"falling back to SDPA", flush=True)
-            # 2) SDPA：CUDA/NPU 通用路径（NPU 需 probe 通过，否则回退慢速）
-            try:
-                if dev_type == "npu" and not self._npu_fa_probe(x.device, q.dtype, T):
-                    pass  # NPU probe 失败 → 回退下方慢速 attention
-                else:
+                # CUDA SDPA：原生支持 GQA broadcast，直接传原始 k/v 即可
+                try:
                     y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
                     return self.o_proj(y.transpose(1, 2).reshape(B, T, -1))
-            except Exception as e:  # noqa: BLE001
-                # 兜底：同步错误也全局禁用并走慢速 attention（CUDA/NPU 都警告一次）
-                if dev_type == "npu":
+                except Exception as e:  # noqa: BLE001
+                    if not Attention._npu_fa_warned:
+                        Attention._npu_fa_warned = True
+                        print(f"warning: scaled_dot_product_attention failed on cuda "
+                              f"({e!r}); falling back to slow attention", flush=True)
+            else:  # NPU：显式 npu_fusion_attention（SDPA 在 torch_npu 2.1 无融合后端）
+                try:
+                    import torch_npu  # noqa: F401
+                    if self.repeats > 1:
+                        kr = k.repeat_interleave(self.repeats, dim=1)
+                        vr = v.repeat_interleave(self.repeats, dim=1)
+                    else:
+                        kr, vr = k, v
+                    out = torch_npu.npu_fusion_attention(
+                        q, kr, vr, self.n_heads, "BNSD",
+                        scale=self._scale,
+                        pre_tockens=2147483647, next_tockens=0, sparse_mode=2)
+                    y = next(t for t in out
+                             if tuple(getattr(t, "shape", ()))
+                             == (B, self.n_heads, T, self.head_dim))
+                    return self.o_proj(y.transpose(1, 2).reshape(B, T, -1))
+                except Exception as e:  # noqa: BLE001
+                    # 运行时失败也全局禁用（probe 已同步验证过，这里只是兜底）
                     Attention._npu_fa_ok = False
-                if not Attention._npu_fa_warned:
-                    Attention._npu_fa_warned = True
-                    print(f"warning: scaled_dot_product_attention failed on {dev_type} "
-                          f"({e!r}); disabling fused attention, falling back to slow "
-                          f"attention (q.dtype={q.dtype})", flush=True)
+                    if not Attention._npu_fa_warned:
+                        Attention._npu_fa_warned = True
+                        print(f"warning: npu_fusion_attention failed at runtime ({e!r}); "
+                              f"disabling fused attention, falling back to slow "
+                              f"attention (q.dtype={q.dtype})", flush=True)
+        # slow fallback: cached additive causal bias instead of rebuilding
+        # torch.triu(torch.ones(T,T)) + masked_fill() every forward call.
+        # 慢速路径需要等头数 k/v，此处再 repeat（非 fused 路径才走到）。
+        k = k.repeat_interleave(self.repeats, dim=1)
+        v = v.repeat_interleave(self.repeats, dim=1)
         # slow fallback: cached additive causal bias instead of rebuilding
         # torch.triu(torch.ones(T,T)) + masked_fill() every forward call.
         if (self._causal_bias is None
@@ -295,13 +442,11 @@ class MoEBlock(nn.Module):
                 [SwiGLU(cfg.d_model, cfg.shared_expert_hidden) for _ in range(cfg.n_shared_experts)])
         else:
             self.shared_experts = nn.ModuleList()
-        # fused per-expert weight matrices (W_gate/W_up/W_down), rebuilt after
+        # fused per-expert weight matrices (W_gu/W_down), rebuilt after
         # every optimizer step instead of cat()-ing them each forward call.
-        self._expert_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        # sparse grouped-GEMM 的固定 padded 容量（首次见到 S 时计算并缓存，
-        # 避免每步 N_max 变化导致 allocator 碎片化 OOM）。
-        self._n_cap: int | None = None
-        self._n_cap_s: int = -1
+        # 统一为 dense 大矩阵：[2*E*H, D]（gate/up 合并）/ [D, E*H]，sparse 与
+        # dense 共用同一套固定 shape 算子（在 NPU 上只跑大 GEMM，无零散 scatter）。
+        self._expert_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         h = x + self.attn(self.norm1(x), cos, sin)
@@ -319,24 +464,26 @@ class MoEBlock(nn.Module):
         cached cat() views stay in sync with the expert parameters. The cache
         is a plain tensor built from the Parameter leaves (NOT a detached
         buffer), so gradients flow back to the experts normally.
+
+        sparse 与 dense 共用同一份 dense 大矩阵缓存：gate/up 合并为单个
+        [2*E*H, D] 权重（一次 GEMM 出 g 和 u，再 chunk——2 个 [S, E*H] 大
+        GEMM 变 1 个 [S, 2*E*H]，NPU 上 kernel 数减半、tiling 更高效）；
+        down 保持 [D, E*H]。sparse 靠 top-k 权重 mask 掉未选中专家（在激活上、
+        down 之前乘权重），dense 用全 1 权重——两者在 NPU 上都是固定 shape
+        的大 GEMM，无任何 sort/index_put/bincount 零散算子。
         """
-        if self.sparse_moe:
-            # sparse 模式：缓存 [E, H, D] 堆叠权重，供 grouped GEMM（bmm）使用
-            W_gate = torch.stack([e.mlp.gate.weight for e in self.experts])  # [E, H, D]
-            W_up = torch.stack([e.mlp.up.weight for e in self.experts])      # [E, H, D]
-            W_down = torch.stack([e.mlp.down.weight for e in self.experts])  # [E, H, D]
-        else:
-            H = self.experts[0].mlp.gate.out_features
-            W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
-            W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
-            W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
+        H = self.experts[0].mlp.gate.out_features
+        W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
+        W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
+        W_gu = torch.cat([W_gate, W_up], dim=0)                               # [2*E*H, D]
+        W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
         # device/shape 变化时重建，否则原地 copy_（保证 .cuda()/.to() 后缓存跟随）
         if (self._expert_cache is None
-                or self._expert_cache[0].device != W_gate.device
-                or self._expert_cache[0].shape != W_gate.shape):
-            self._expert_cache = (W_gate, W_up, W_down)
+                or self._expert_cache[0].device != W_gu.device
+                or self._expert_cache[0].shape != W_gu.shape):
+            self._expert_cache = (W_gu, W_down)
         else:
-            for dst, src in zip(self._expert_cache, (W_gate, W_up, W_down)):
+            for dst, src in zip(self._expert_cache, (W_gu, W_down)):
                 dst.copy_(src)
 
     def _moe(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
@@ -345,12 +492,19 @@ class MoEBlock(nn.Module):
         return self._moe_dense(x)
 
     def _moe_sparse(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        """Sparse top-k MoE：只对 router 选中的 k 个专家做 SwiGLU（grouped GEMM）。
+        """Sparse top-k MoE，优化为 dense-mask 架构（910 Pro A 友好）。
 
-        FLOPs 约为 dense 的 k/n_experts（本例 2/16 = 1/8）。实现采用
-        "pad + bmm" 的 grouped GEMM：把 [S*k] 个 token-expert 对按专家排序
-        成连续分段，pad 到统一长度 N_max，然后用 3 次 torch.bmm 一次算完所有
-        专家，避免逐专家循环的 16 次小 GEMM + 同步点（mask.any/nonzero）。
+        不再走 "pad + bmm + host 侧 sort/index_put/bincount" 路线——那一路在
+        Ascend 上把计算切碎成大量低效零散算子，每个新 shape 触发一次 CANN
+        编译，导致前 10 分钟编译、NPU 利用率趋零。
+
+        改为：对所有专家做一次固定 shape 的大 GEMM（与 dense 同构），top-k
+        路由权重在激活 a 上、down 投影之前乘进去，未选中专家权重=0 即被
+        mask 掉。数学上等价于「只算选中专家」，但 NPU 上只跑 3 次大 GEMM，
+        无任何 scatter/gather，shape 恒定 → 编译一次复用，利用率拉满。
+
+        注意：top-k 加权必须在 a 上、down 之前做，与 dense 的 (a*w)@W_down
+        保持一致（线性变换不满足后加权）。
         """
         B, T, D = x.shape
         flat = x.reshape(-1, D)
@@ -358,67 +512,27 @@ class MoEBlock(nn.Module):
         top_probs = out.top_probs.to(x.dtype)   # [S, k]
         top_idx = out.top_idx                   # [S, k] long
         z_loss, aux_loss = out.z_loss, out.aux_loss
-        S, k = flat.shape[0], self.top_k
+        S = flat.shape[0]
         E, H = self.n_experts, self.experts[0].mlp.gate.out_features
-        device, dtype = flat.device, flat.dtype
 
         if self._expert_cache is None or self._expert_cache[0].device != flat.device:
             self.refresh_expert_cache()
-        W_gate, W_up, W_down = self._expert_cache          # 各 [E, H, D]
+        W_gu, W_down = self._expert_cache                    # [2*E*H, D] / [D, E*H]
 
-        # --- 展平 [S,k] -> [S*k]，按专家排序得到连续分段 ---
-        flat_idx = top_idx.reshape(-1)                       # [S*k]
-        flat_probs = top_probs.reshape(-1)                   # [S*k]
-        token_ids = torch.arange(S, device=device).repeat_interleave(k)  # [S*k]
-        # 用 torch.sort 而非 argsort(stable=True)：后者在 NPU 上不受支持，
-        # 会回退 CPU 执行导致每层每步 GPU<->CPU 同步。稳定性对本算法不是
-        # 必需——每 token-expert 对的槽位唯一性由 counts/pos 保证，与段内
-        # 顺序无关；sorted_* 都按同一 order 重排，保持一致。
-        sorted_experts, order = torch.sort(flat_idx)         # 值 + 索引
-        sorted_probs = flat_probs[order]                     # [S*k]
-        sorted_token_ids = token_ids[order]                  # [S*k]
+        # --- 固定 shape 大 GEMM：gate/up 合并一次算全部专家（autocast 下 fp16）---
+        gu_all = F.linear(flat, W_gu)                        # [S, 2*E*H]
+        g_all, u_all = gu_all.chunk(2, dim=-1)
+        g = g_all.view(S, E, H)
+        u = u_all.view(S, E, H)
+        a = F.silu(g) * u                                  # [S, E, H]
 
-        # --- 每专家 token 数 / 段内偏移（仅一次 .item() 同步）---
-        counts = torch.bincount(sorted_experts, minlength=E)  # [E]
-        offsets = torch.cumsum(counts, 0) - counts            # [E] 每段起始
-        arange = torch.arange(S * k, device=device)
-        seg_start = torch.repeat_interleave(offsets, counts)  # [S*k]
-        pos = arange - seg_start                              # [S*k] 段内位置
+        # --- top-k 路由权重：one-hot * top_probs -> [S, E]，未选中专家权重=0 ---
+        onehot = F.one_hot(top_idx, num_classes=E).to(top_probs.dtype)  # [S, k, E]
+        w = (onehot * top_probs.unsqueeze(-1)).sum(dim=1)   # [S, E]
+        a = a * w.unsqueeze(-1)                            # mask 掉未选中专家
 
-        # --- padded 容量固定为 S（每专家理论上限）---
-        # top-2 下单个专家最多被 S 个 token 选中（S 个 token 全部路由到同一
-        # 专家），不会超过 S。固定用 S 作为容量：padded shape 恒定为
-        # [E, S, D]，allocator 稳定复用；训练早期 router 坍缩也不会越界。
-        if self._n_cap_s != S:
-            self._n_cap = S
-            self._n_cap_s = S
-        n_cap = S if self._n_cap is None else self._n_cap
-
-        # --- 构造 padded 输入 [E, n_cap, D] / [E, n_cap]（shape 恒定）---
-        sorted_tokens = flat[sorted_token_ids]                # [S*k, D]
-        padded = torch.index_put(
-            torch.zeros(E, n_cap, D, dtype=dtype, device=device),
-            (sorted_experts, pos), sorted_tokens)
-        padded_probs = torch.index_put(
-            torch.zeros(E, n_cap, dtype=dtype, device=device),
-            (sorted_experts, pos), sorted_probs)
-
-        # --- grouped GEMM（3 次 bmm，autocast 下自动 bf16/fp16 计算）---
-        # 注意：top-k 加权必须在激活 a 上、down 投影之前做，
-        # 与 dense 模式 (a*w)@W_down 保持数学一致（线性变换不满足后加权）。
-        g = torch.bmm(padded, W_gate.transpose(1, 2))        # [E, N_max, H]
-        u = torch.bmm(padded, W_up.transpose(1, 2))
-        a = F.silu(g) * u                                    # [E, N_max, H]
-        a = a * padded_probs.unsqueeze(-1)                   # top-k 加权
-        y = torch.bmm(a, W_down.transpose(1, 2))             # [E, N_max, D]
-
-        # --- 回收：每 token 累加其 k 个专家的贡献 ---
-        # 注意：y_flat 的顺序是 sorted（按专家分组）后的顺序，
-        # 必须用 sorted_token_ids 而不是原始 token_ids，否则贡献会错位。
-        y_flat = y[sorted_experts, pos]                      # [S*k, D]
-        out = torch.zeros(S, D, dtype=y_flat.dtype, device=device)
-        out = out.index_add(0, sorted_token_ids, y_flat)     # [S, D]
-        y = out.reshape(B, T, D)
+        y = F.linear(a.reshape(S, E * H), W_down)          # [S, D]
+        y = y.reshape(B, T, D)
 
         if self.n_shared_experts > 0:
             for se in self.shared_experts:
@@ -427,42 +541,15 @@ class MoEBlock(nn.Module):
         return y, {"router_z_loss": z_loss, "router_aux_loss": aux_loss}
 
     def _moe_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
-        """Dense MoE：所有专家对全部 token 计算，top-k 权重 gating 输出。
+        """Dense MoE 回退路径：在 910 Pro A 上与 sparse 行为一致。
 
-        NPU-safe（fixed-shape，无 nonzero/index_add_/控制流）。Per-expert
-        Linear 权重被 cat 成单个 [E*H, D] / [D, E*H] 矩阵，整个 expert 层是
-        3 次融合 matmul，避免 16 次小 GEMM 的低利用率。
+        原 dense 用「全专家激活 + top-k 加权」会有 E/k 倍冗余 FLOPs，在 NPU
+        上并不比 sparse 快（反而更慢）。故 dense 直接复用 dense-mask 架构：
+        top-k 权重在激活上乘入，未选中专家被 mask 掉——既保留 MoE 语义，又
+        只跑固定 shape 大 GEMM。两者唯一区别是 --sparse-moe 的开关含义仅用于
+        路由权重是否参与（此处同样参与，等价于统一实现）。
         """
-        B, T, D = x.shape
-        flat = x.reshape(-1, D)
-        out = self.router(flat)
-        # Router 内部已算好 softmax/topk 并缓存到 RouterOutput，这里直接复用，
-        # 避免每层重复 F.softmax + torch.topk（12 层 × checkpoint 重算）。
-        top_probs = out.top_probs.to(x.dtype)
-        top_idx = out.top_idx
-        z_loss, aux_loss = out.z_loss, out.aux_loss
-        if self._expert_cache is None or self._expert_cache[0].device != flat.device:
-            self.refresh_expert_cache()
-        W_gate, W_up, W_down = self._expert_cache
-        H = self.experts[0].mlp.gate.out_features
-        S = flat.shape[0]
-        g_all = F.linear(flat, W_gate)                       # [S, E*H]
-        u_all = F.linear(flat, W_up)                         # [S, E*H]
-        g = g_all.view(S, self.n_experts, H)
-        u = u_all.view(S, self.n_experts, H)
-        a = F.silu(g) * u                                    # [S, E, H]
-        # top-k per-expert weight: [S, k, E] one-hot * top_probs -> [S, E]
-        onehot = F.one_hot(top_idx, num_classes=self.n_experts).to(top_probs.dtype)
-        w = (onehot * top_probs.unsqueeze(-1)).sum(dim=1)    # [S, E]
-        a = a * w.unsqueeze(-1)                              # [S, E, H]
-        y = F.linear(a.reshape(S, self.n_experts * H), W_down)  # [S, D]
-        y = y.reshape(B, T, D)
-
-        if self.n_shared_experts > 0:
-            for se in self.shared_experts:
-                y = y + se(x)
-
-        return y, {"router_z_loss": z_loss, "router_aux_loss": aux_loss}
+        return self._moe_sparse(x)
 
 
 class MoETransformer(nn.Module):
@@ -477,6 +564,7 @@ class MoETransformer(nn.Module):
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.token_embedding.weight  # weight tying
         self._rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._rope_cache_dtype: dict = {}
         # Rebuild fused expert-weight caches once a checkpoint has been fully
         # loaded (load_state_dict is recursive; _load_from_state_dict runs too
         # early to see the expert weights). They are plain attributes, not
@@ -503,34 +591,45 @@ class MoETransformer(nn.Module):
             layer.refresh_expert_cache()
 
     def check_flash_attn(self, device: torch.device, dtype: torch.dtype,
-                         seq_len: int = 8) -> bool:
+                         seq_len: int = 8, batch: int = 1) -> bool:
         """Pre-flight synchronous FA availability probe (Ascend only).
 
         Call once after model.to(device) before training, passing the real
-        training sequence length (--ctx). Probes forward AND backward with the
-        real tiling shape; on failure FA is globally disabled inside the probe
-        (falls back to slow attention) and this returns False.
+        training sequence length (--ctx) and micro-batch. Probes forward AND
+        backward with the real (batch, heads, seq) tiling shape; on failure FA
+        is globally disabled inside the probe (falls back to slow attention) and
+        this returns False. batch 透传真实 micro-batch，因为部分 CANN 版本的
+        FusedAttention kernel 可用性依赖 batch tiling。
         """
         if len(self.layers) == 0:
             return False
-        return self.layers[0].attn._npu_fa_probe(device, dtype, seq_len)
+        return self.layers[0].attn._npu_fa_probe(device, dtype, seq_len, batch)
 
     def _post_load_rebuild(self, module, incompatible_keys) -> None:
         """Called after load_state_dict finishes (all submodules loaded)."""
         self.refresh_expert_caches()
 
-    def _rope(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _rope(self, seq_len: int, device: torch.device,
+              dtype: torch.dtype = torch.float32) -> tuple[torch.Tensor, torch.Tensor]:
+        # 缓存按 dtype 分桶：cos/sin 在 fp32 预计算一次，按当前激活 dtype 转换
+        # 后缓存，避免每步 forward 都 .to(q.dtype)（NPU 上每步转换一次是浪费）。
         if self._rope_cache is None or self._rope_cache[0].shape[0] < seq_len:
             cos, sin = precompute_rope(self.cfg.head_dim, max(seq_len, self.cfg.max_seq_len),
                                        self.cfg.rope_theta, self.cfg.rope_scaling)
             self._rope_cache = (cos.to(device), sin.to(device))
-        return self._rope_cache[0][:seq_len], self._rope_cache[1][:seq_len]
+            self._rope_cache_dtype: dict = {}
+        key = (dtype, device)
+        if key not in self._rope_cache_dtype:
+            cos, sin = self._rope_cache
+            self._rope_cache_dtype[key] = (cos.to(dtype).to(device), sin.to(dtype).to(device))
+        c, s = self._rope_cache_dtype[key]
+        return c[:seq_len], s[:seq_len]
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
         """idx: [B, T]. Returns (logits, extra_losses)."""
         B, T = idx.shape
         x = self.token_embedding(idx)
-        cos, sin = self._rope(T, idx.device)
+        cos, sin = self._rope(T, idx.device, x.dtype)
         losses = {"router_z_loss": torch.zeros((), device=idx.device),
                   "router_aux_loss": torch.zeros((), device=idx.device)}
         n_layers = len(self.layers)

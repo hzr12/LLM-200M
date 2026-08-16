@@ -57,10 +57,11 @@ class Config:
     # npu_fusion_attention 的输入布局："bnsd"（[B,N,S,D]）或 "bsh"（[B,S,H]）。
     # 部分 CANN 版本只对其中一种布局提供 kernel，可在此切换。
     fa_layout: str = "bnsd"
-    # sparse MoE：只对 router 选中的 top-k 专家做计算（FLOPs 约为全专家激活的
-    # k/E），默认开启以提速。通过训练脚本 --sparse-moe 0/1 显式控制（默认
-    # 开启；NPU 上若 index_add 算子不稳定，传 --sparse-moe 0 回退到
-    # "全专家计算 + top-k 加权" 的 dense 模式）。
+    # sparse MoE：sparse 与 dense 在 910 Pro A 上已统一为 dense-mask 架构——
+    # 对所有专家做一次固定 shape 大 GEMM，top-k 路由权重在激活上、down 投影
+    # 之前乘入，未选中专家权重=0 即被 mask 掉（数学等价于只算选中专家，但 NPU
+    # 上只跑大 GEMM，无 sort/index_put/bincount 零散算子）。--sparse-moe 0/1
+    # 仅作语义开关，两种路径现在共用同一实现，默认开启。
     sparse_moe: bool = True
 
     @classmethod
