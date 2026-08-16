@@ -57,6 +57,11 @@ class Config:
     # npu_fusion_attention 的输入布局："bnsd"（[B,N,S,D]）或 "bsh"（[B,S,H]）。
     # 部分 CANN 版本只对其中一种布局提供 kernel，可在此切换。
     fa_layout: str = "bnsd"
+    # sparse MoE：只对 router 选中的 top-k 专家做计算（FLOPs 约为全专家激活的
+    # k/E），默认开启以提速。通过训练脚本 --sparse-moe 0/1 显式控制（默认
+    # 开启；NPU 上若 index_add 算子不稳定，传 --sparse-moe 0 回退到
+    # "全专家计算 + top-k 加权" 的 dense 模式）。
+    sparse_moe: bool = True
 
     @classmethod
     def from_name(cls, name: str) -> "Config":

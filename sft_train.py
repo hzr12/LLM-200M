@@ -104,6 +104,10 @@ def main():
                          "可用 --flash-attention 1/0 显式指定")
     ap.add_argument("--fa-layout", default="bnsd", choices=["bnsd", "bsh"],
                     help="npufusion_attention 输入布局：bnsd=[B,N,S,D]（默认），bsh=[B,S,H]")
+    ap.add_argument("--sparse-moe", type=_str2bool, default=None,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="sparse MoE：只对 router 选中的 top-k 专家计算（FLOPs 约降为 k/E，"
+                         "默认开启）。关闭用 --sparse-moe 0（回退全专家计算 + top-k 加权）")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -126,6 +130,8 @@ def main():
     cfg.gradient_checkpointing = args.gradient_checkpointing
     cfg.use_flash_attn = args.flash_attention
     cfg.fa_layout = args.fa_layout
+    if args.sparse_moe is not None:
+        cfg.sparse_moe = args.sparse_moe
     model = MoETransformer(cfg).to(device)
     model.load_state_dict(ckpt["model"])
     # FA pre-flight 同步探测：npu_fusion_attention 是异步算子，若该 CANN 环境

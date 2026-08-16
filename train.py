@@ -213,6 +213,11 @@ def main():
     ap.add_argument("--fa-layout", default="bnsd", choices=["bnsd", "bsh"],
                     help="npufusion_attention 输入布局：bnsd=[B,N,S,D]（默认），bsh=[B,S,H]。"
                          "部分 CANN 版本只对其中一种布局提供 kernel")
+    ap.add_argument("--sparse-moe", type=_str2bool, default=None,
+                    nargs="?", const=True, metavar="BOOL",
+                    help="sparse MoE：只对 router 选中的 top-k 专家计算（FLOPs 约降为 k/E，"
+                         "默认开启）。关闭用 --sparse-moe 0（回退全专家计算 + top-k 加权，"
+                         "NPU 上若 index_add 算子不稳定可用）")
     # run
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
@@ -252,6 +257,8 @@ def main():
     cfg.gradient_checkpointing = args.gradient_checkpointing
     cfg.use_flash_attn = args.flash_attention
     cfg.fa_layout = args.fa_layout
+    if args.sparse_moe is not None:
+        cfg.sparse_moe = args.sparse_moe
     if meta["vocab_size"] != cfg.vocab_size:
         print(f"note: overriding cfg.vocab_size {cfg.vocab_size} -> {meta['vocab_size']} from meta.json")
         cfg.vocab_size = meta["vocab_size"]

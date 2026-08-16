@@ -286,6 +286,7 @@ class MoEBlock(nn.Module):
         self.router = router
         self.n_experts = cfg.n_experts
         self.top_k = cfg.top_k
+        self.sparse_moe = cfg.sparse_moe
         self.shared_mlp = SwiGLU(cfg.d_model, cfg.mlp_hidden) if cfg.mlp_hidden else None
         self.experts = nn.ModuleList([Expert(cfg) for _ in range(cfg.n_experts)])
         self.n_shared_experts = cfg.n_shared_experts
@@ -315,17 +316,108 @@ class MoEBlock(nn.Module):
         is a plain tensor built from the Parameter leaves (NOT a detached
         buffer), so gradients flow back to the experts normally.
         """
-        H = self.experts[0].mlp.gate.out_features
-        W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
-        W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
-        W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
-        if self._expert_cache is None:
+        if self.sparse_moe:
+            # sparse 模式：缓存 [E, H, D] 堆叠权重，供 grouped GEMM（bmm）使用
+            W_gate = torch.stack([e.mlp.gate.weight for e in self.experts])  # [E, H, D]
+            W_up = torch.stack([e.mlp.up.weight for e in self.experts])      # [E, H, D]
+            W_down = torch.stack([e.mlp.down.weight for e in self.experts])  # [E, H, D]
+        else:
+            H = self.experts[0].mlp.gate.out_features
+            W_gate = torch.cat([e.mlp.gate.weight for e in self.experts], dim=0)  # [E*H, D]
+            W_up = torch.cat([e.mlp.up.weight for e in self.experts], dim=0)      # [E*H, D]
+            W_down = torch.cat([e.mlp.down.weight for e in self.experts], dim=1)  # [D, E*H]
+        # device/shape 变化时重建，否则原地 copy_（保证 .cuda()/.to() 后缓存跟随）
+        if (self._expert_cache is None
+                or self._expert_cache[0].device != W_gate.device
+                or self._expert_cache[0].shape != W_gate.shape):
             self._expert_cache = (W_gate, W_up, W_down)
         else:
             for dst, src in zip(self._expert_cache, (W_gate, W_up, W_down)):
                 dst.copy_(src)
 
     def _moe(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        if self.sparse_moe:
+            return self._moe_sparse(x)
+        return self._moe_dense(x)
+
+    def _moe_sparse(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """Sparse top-k MoE：只对 router 选中的 k 个专家做 SwiGLU（grouped GEMM）。
+
+        FLOPs 约为 dense 的 k/n_experts（本例 2/16 = 1/8）。实现采用
+        "pad + bmm" 的 grouped GEMM：把 [S*k] 个 token-expert 对按专家排序
+        成连续分段，pad 到统一长度 N_max，然后用 3 次 torch.bmm 一次算完所有
+        专家，避免逐专家循环的 16 次小 GEMM + 同步点（mask.any/nonzero）。
+        """
+        B, T, D = x.shape
+        flat = x.reshape(-1, D)
+        out = self.router(flat)
+        top_probs = out.top_probs.to(x.dtype)   # [S, k]
+        top_idx = out.top_idx                   # [S, k] long
+        z_loss, aux_loss = out.z_loss, out.aux_loss
+        S, k = flat.shape[0], self.top_k
+        E, H = self.n_experts, self.experts[0].mlp.gate.out_features
+        device, dtype = flat.device, flat.dtype
+
+        if self._expert_cache is None or self._expert_cache[0].device != flat.device:
+            self.refresh_expert_cache()
+        W_gate, W_up, W_down = self._expert_cache          # 各 [E, H, D]
+
+        # --- 展平 [S,k] -> [S*k]，按专家排序得到连续分段 ---
+        flat_idx = top_idx.reshape(-1)                       # [S*k]
+        flat_probs = top_probs.reshape(-1)                   # [S*k]
+        token_ids = torch.arange(S, device=device).repeat_interleave(k)  # [S*k]
+        order = torch.argsort(flat_idx, stable=True)
+        sorted_experts = flat_idx[order]                     # [S*k]
+        sorted_probs = flat_probs[order]                     # [S*k]
+        sorted_token_ids = token_ids[order]                  # [S*k]
+
+        # --- 每专家 token 数 / 段内偏移（仅一次 .item() 同步）---
+        counts = torch.bincount(sorted_experts, minlength=E)  # [E]
+        N_max = int(counts.max().item())
+        offsets = torch.cumsum(counts, 0) - counts            # [E] 每段起始
+        arange = torch.arange(S * k, device=device)
+        seg_start = torch.repeat_interleave(offsets, counts)  # [S*k]
+        pos = arange - seg_start                              # [S*k] 段内位置
+
+        # --- 构造 padded 输入 [E, N_max, D] / [E, N_max] ---
+        sorted_tokens = flat[sorted_token_ids]                # [S*k, D]
+        padded = torch.index_put(
+            torch.zeros(E, N_max, D, dtype=dtype, device=device),
+            (sorted_experts, pos), sorted_tokens)
+        padded_probs = torch.index_put(
+            torch.zeros(E, N_max, dtype=dtype, device=device),
+            (sorted_experts, pos), sorted_probs)
+
+        # --- grouped GEMM（3 次 bmm，autocast 下自动 bf16/fp16 计算）---
+        # 注意：top-k 加权必须在激活 a 上、down 投影之前做，
+        # 与 dense 模式 (a*w)@W_down 保持数学一致（线性变换不满足后加权）。
+        g = torch.bmm(padded, W_gate.transpose(1, 2))        # [E, N_max, H]
+        u = torch.bmm(padded, W_up.transpose(1, 2))
+        a = F.silu(g) * u                                    # [E, N_max, H]
+        a = a * padded_probs.unsqueeze(-1)                   # top-k 加权
+        y = torch.bmm(a, W_down.transpose(1, 2))             # [E, N_max, D]
+
+        # --- 回收：每 token 累加其 k 个专家的贡献 ---
+        # 注意：y_flat 的顺序是 sorted（按专家分组）后的顺序，
+        # 必须用 sorted_token_ids 而不是原始 token_ids，否则贡献会错位。
+        y_flat = y[sorted_experts, pos]                      # [S*k, D]
+        out = torch.zeros(S, D, dtype=y_flat.dtype, device=device)
+        out = out.index_add(0, sorted_token_ids, y_flat)     # [S, D]
+        y = out.reshape(B, T, D)
+
+        if self.n_shared_experts > 0:
+            for se in self.shared_experts:
+                y = y + se(x)
+
+        return y, {"router_z_loss": z_loss, "router_aux_loss": aux_loss}
+
+    def _moe_dense(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """Dense MoE：所有专家对全部 token 计算，top-k 权重 gating 输出。
+
+        NPU-safe（fixed-shape，无 nonzero/index_add_/控制流）。Per-expert
+        Linear 权重被 cat 成单个 [E*H, D] / [D, E*H] 矩阵，整个 expert 层是
+        3 次融合 matmul，避免 16 次小 GEMM 的低利用率。
+        """
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         out = self.router(flat)
@@ -334,14 +426,6 @@ class MoEBlock(nn.Module):
         top_probs = out.top_probs.to(x.dtype)
         top_idx = out.top_idx
         z_loss, aux_loss = out.z_loss, out.aux_loss
-        # NPU-safe routing: fixed-shape compute only.  No nonzero / index_add_ /
-        # data-dependent control flow (both hang CANN graph compilation).
-        # All experts run on ALL tokens; the top-k weights gate their outputs.
-        # Per-expert Linear weights are concatenated into single [E*H, D] /
-        # [D, E*H] matrices so the whole expert layer is 3 fused matmuls
-        # instead of 16 sequential SwiGLU calls (much higher NPU utilization).
-        # The cat() is cached and only rebuilt after each optimizer step
-        # (refresh_expert_cache), so we don't redo it every forward call.
         if self._expert_cache is None or self._expert_cache[0].device != flat.device:
             self.refresh_expert_cache()
         W_gate, W_up, W_down = self._expert_cache
