@@ -31,6 +31,9 @@ def run_npu_smi():
 
 
 def probe_rmsnorm():
+    if not hasattr(ops, "RmsNorm"):
+        print("PROBE RmsNorm: ops.RmsNorm NOT AVAILABLE on this version", flush=True)
+        return
     D = 768
     rms = ops.RmsNorm(epsilon=1e-6)
     for dtype, scale in ((ms.float32, 0.5), (ms.float16, 0.5)):
@@ -69,6 +72,9 @@ def elem_rope_ref(q: np.ndarray, cos: np.ndarray, sin: np.ndarray,
 
 
 def probe_apply_rotary():
+    if not hasattr(ops, "ApplyRotaryPosEmb"):
+        print("PROBE ApplyRotaryPosEmb: NOT AVAILABLE on this version", flush=True)
+        return
     B, S, N, D = 1, 4, 2, 8
     q = ms.Tensor(np.random.randn(B, S, N, D).astype(np.float32) * 0.5, ms.float32)
     cos = ms.Tensor(np.cos(np.arange(S * (D // 2)).reshape(S, D // 2) * 0.1).astype(np.float32), ms.float32)

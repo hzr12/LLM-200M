@@ -93,11 +93,13 @@ class RMSNorm(nn.Cell):
         self.weight = ms.Parameter(ms.Tensor(np.ones(dim, np.float32), ms.float32),
                                    name="weight")
         self.eps = eps
-        self._fused = ops.RmsNorm(epsilon=eps)
+        # fused ops.RmsNorm exists on MS 2.7 (910B) but NOT on 2.2 (910 Pro A)
+        self._fused = ops.RmsNorm(epsilon=eps) if hasattr(ops, "RmsNorm") else None
 
     def construct(self, x: ms.Tensor) -> ms.Tensor:
         w = self.weight.to(x.dtype)
-        if RMSNorm._fused_ok and x.dtype in (ms.float16, ms.bfloat16):
+        if self._fused is not None and RMSNorm._fused_ok \
+                and x.dtype in (ms.float16, ms.bfloat16):
             out = self._fused(x, w)
             return out[0] if isinstance(out, tuple) else out
         rms = ops.rsqrt(ops.pow(x.float(), 2.0).mean(axis=-1, keep_dims=True)
@@ -169,8 +171,8 @@ class Attention(nn.Cell):
                 input_layout="BNSD", sparse_mode=self._sparse_mode)
             y = out[0] if isinstance(out, tuple) else out
         else:
-            k = ops.repeat_interleave(k, self.repeats, axis=1)
-            v = ops.repeat_interleave(v, self.repeats, axis=1)
+            k = ops.repeat_interleave(k, self.repeats, dim=1)
+            v = ops.repeat_interleave(v, self.repeats, dim=1)
             att = ops.matmul(q * self._scale, k.swapaxes(-2, -1))
             att = att + self._causal_bias[..., :T, :T]
             p = ops.softmax(att, axis=-1)
@@ -247,7 +249,7 @@ class MoEBlock(nn.Cell):
         g_all, u_all = gu[..., :EH], gu[..., EH:]
         g = g_all.reshape(S, E, H)
         u = u_all.reshape(S, E, H)
-        a = ops.silu(g) * u                    # [S, E, H]
+        a = g * ops.sigmoid(g) * u            # silu(g) * u; sigmoid avoids ops.silu (absent on 2.2)
         w = (ops.one_hot(top_idx, E, 1.0, 0.0, axis=-1).to(x.dtype)
              * top_probs.to(x.dtype).unsqueeze(-1)).sum(axis=1)  # [S, E]
         a = a * w.unsqueeze(-1)
@@ -305,40 +307,44 @@ class MoETransformer(nn.Cell):
         B, T, D = batch, seq_len, self.cfg.d_model
         print(f"probe: fused ops with shape B={B} T={T} dtype={dtype}", flush=True)
         # --- RmsNorm ---
-        try:
-            x = ms.Tensor(np.random.randn(B, T, D).astype(np.float32) * 0.5, dtype)
-
-            class RmFused(nn.Cell):
-                def __init__(self, g):
-                    super().__init__()
-                    self.g = g
-                    self.rms = ops.RmsNorm(epsilon=1e-6)
-                def construct(self, xx):
-                    out = self.rms(xx, self.g.to(xx.dtype))
-                    return (out[0] if isinstance(out, tuple) else out).sum()
-
-            class RmElem(nn.Cell):
-                def __init__(self, g):
-                    super().__init__()
-                    self.g = g
-                def construct(self, xx):
-                    rms = ops.rsqrt(ops.pow(xx.float(), 2.0).mean(axis=-1, keep_dims=True).add(1e-6))
-                    return (xx * rms.to(xx.dtype) * self.g.to(xx.dtype)).sum()
-
-            g1 = ms.Parameter(ms.Tensor(np.ones(D, np.float32), ms.float32), name="g1")
-            g2 = ms.Parameter(ms.Tensor(np.ones(D, np.float32), ms.float32), name="g2")
-            l1, (dg1,) = ms.value_and_grad(RmFused(g1), grad_position=None,
-                                           weights=[g1])(x)
-            l2, (dg2,) = ms.value_and_grad(RmElem(g2), grad_position=None,
-                                           weights=[g2])(x)
-            err = max(float(abs(l1.asnumpy() - l2.asnumpy())) / max(1.0, float(abs(l2.asnumpy()))),
-                      float(np.abs(dg1.asnumpy() - dg2.asnumpy()).max())
-                      / (float(np.abs(dg2.asnumpy()).max()) + 1e-8))
-            RMSNorm._fused_ok = err < 1e-2
-            print(f"probe: RmsNorm fused rel_err={err:.4f} -> _fused_ok={RMSNorm._fused_ok}", flush=True)
-        except Exception as e:  # noqa: BLE001
+        if not hasattr(ops, "RmsNorm"):
             RMSNorm._fused_ok = False
-            print(f"probe: RmsNorm fused FAILED ({e!r}) -> _fused_ok=False", flush=True)
+            print("probe: ops.RmsNorm unavailable -> elementwise RMSNorm", flush=True)
+        else:
+            try:
+                x = ms.Tensor(np.random.randn(B, T, D).astype(np.float32) * 0.5, dtype)
+
+                class RmFused(nn.Cell):
+                    def __init__(self, g):
+                        super().__init__()
+                        self.g = g
+                        self.rms = ops.RmsNorm(epsilon=1e-6)
+                    def construct(self, xx):
+                        out = self.rms(xx, self.g.to(xx.dtype))
+                        return (out[0] if isinstance(out, tuple) else out).sum()
+
+                class RmElem(nn.Cell):
+                    def __init__(self, g):
+                        super().__init__()
+                        self.g = g
+                    def construct(self, xx):
+                        rms = ops.rsqrt(ops.pow(xx.float(), 2.0).mean(axis=-1, keep_dims=True).add(1e-6))
+                        return (xx * rms.to(xx.dtype) * self.g.to(xx.dtype)).sum()
+
+                g1 = ms.Parameter(ms.Tensor(np.ones(D, np.float32), ms.float32), name="g1")
+                g2 = ms.Parameter(ms.Tensor(np.ones(D, np.float32), ms.float32), name="g2")
+                l1, (dg1,) = ms.value_and_grad(RmFused(g1), grad_position=None,
+                                               weights=[g1])(x)
+                l2, (dg2,) = ms.value_and_grad(RmElem(g2), grad_position=None,
+                                               weights=[g2])(x)
+                err = max(float(abs(l1.asnumpy() - l2.asnumpy())) / max(1.0, float(abs(l2.asnumpy()))),
+                          float(np.abs(dg1.asnumpy() - dg2.asnumpy()).max())
+                          / (float(np.abs(dg2.asnumpy()).max()) + 1e-8))
+                RMSNorm._fused_ok = err < 1e-2
+                print(f"probe: RmsNorm fused rel_err={err:.4f} -> _fused_ok={RMSNorm._fused_ok}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                RMSNorm._fused_ok = False
+                print(f"probe: RmsNorm fused FAILED ({e!r}) -> _fused_ok=False", flush=True)
         # --- FlashAttention ---
         if not (hasattr(ops, "flash_attention_score")
                 and dtype in (ms.float16, ms.bfloat16)):
@@ -404,7 +410,7 @@ class MoETransformer(nn.Cell):
         z = z / n
         a = a / n
         x = self.norm(x)
-        logits = _ld(x, self.emb_w)  # tied lm_head
+        logits = _ld(x, self.emb_w.swapaxes(0, 1))  # tied lm_head
         return logits, z, a
 
     def generate(self, idx: ms.Tensor, max_new_tokens: int, temperature: float = 0.8,

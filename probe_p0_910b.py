@@ -55,9 +55,9 @@ def probe_fa_forward():
     B, S, N, KV, D = 2, 64, 4, 2, 64
     scale = D ** -0.5
     for dtype, dtname in ((ms.float16, "fp16"), (ms.bfloat16, "bf16")):
-        q = ms.Tensor(np.random.randn(B, S, N, D).astype(np.float32) * 0.5, dtype)
-        k = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
-        v = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
+        q = ms.Tensor(np.random.randn(B, N, S, D).astype(np.float32) * 0.5, dtype)
+        k = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
+        v = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
         for sparse in (2, 0):
             # BNSD layout (GQA: N != KV)
             try:
@@ -66,9 +66,10 @@ def probe_fa_forward():
                     pre_tokens=2147483647, next_tokens=0, inner_precise=0,
                     input_layout="BNSD", sparse_mode=sparse)
                 y = _fa_y(out)
+                y.asnumpy()  # sync: FA errors surface at the next op, catch here
                 # reference on repeated kv
-                kr = k.repeat_interleave(N // KV, axis=1)
-                vr = v.repeat_interleave(N // KV, axis=1)
+                kr = k.repeat_interleave(N // KV, dim=1)
+                vr = v.repeat_interleave(N // KV, dim=1)
                 ref = slow_attn_np(q.asnumpy().astype(np.float64),
                                    kr.asnumpy().astype(np.float64),
                                    vr.asnumpy().astype(np.float64), scale,
@@ -89,9 +90,10 @@ def probe_fa_forward():
                     pre_tokens=2147483647, next_tokens=0, inner_precise=0,
                     input_layout="BSH", sparse_mode=sparse)
                 y = _fa_y(out)
+                y.asnumpy()  # sync
                 yn = y.reshape(B, S, N, D).swapaxes(1, 2)
-                kr = k.repeat_interleave(N // KV, axis=1)
-                vr = v.repeat_interleave(N // KV, axis=1)
+                kr = k.repeat_interleave(N // KV, dim=1)
+                vr = v.repeat_interleave(N // KV, dim=1)
                 ref = slow_attn_np(q.asnumpy().astype(np.float64),
                                    kr.asnumpy().astype(np.float64),
                                    vr.asnumpy().astype(np.float64), scale,
@@ -108,12 +110,12 @@ def probe_fa_grad():
     B, S, N, KV, D = 2, 64, 4, 2, 64
     scale = D ** -0.5
     for dtype, dtname in ((ms.float16, "fp16"), (ms.bfloat16, "bf16")):
-        q = ms.Tensor(np.random.randn(B, S, N, D).astype(np.float32) * 0.5, dtype)
-        k = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
-        v = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
-        qr = ms.Tensor(np.random.randn(B, S, N, D).astype(np.float32) * 0.5, dtype)
-        kr = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
-        vr = ms.Tensor(np.random.randn(B, S, KV, D).astype(np.float32) * 0.5, dtype)
+        q = ms.Tensor(np.random.randn(B, N, S, D).astype(np.float32) * 0.5, dtype)
+        k = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
+        v = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
+        qr = ms.Tensor(np.random.randn(B, N, S, D).astype(np.float32) * 0.5, dtype)
+        kr = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
+        vr = ms.Tensor(np.random.randn(B, KV, S, D).astype(np.float32) * 0.5, dtype)
 
         class FACell(nn.Cell):
             def __init__(self, sparse):
@@ -132,8 +134,8 @@ def probe_fa_grad():
                 self.causal = causal
             def construct(self, qq, kk, vv):
                 # repeat kv to N heads in fp32 for the reference
-                kkr = kk.repeat_interleave(N // KV, axis=1).float()
-                vvr = vv.repeat_interleave(N // KV, axis=1).float()
+                kkr = kk.repeat_interleave(N // KV, dim=1).float()
+                vvr = vv.repeat_interleave(N // KV, dim=1).float()
                 scores = ops.matmul(qq.float(), kkr.swapaxes(-2, -1)) * scale
                 if self.causal:
                     bias = np.tril(np.ones((S, S), np.float32))[None, None]
@@ -147,6 +149,7 @@ def probe_fa_grad():
                 fa_cell = FACell(sparse)
                 gfn = ms.value_and_grad(fa_cell, grad_position=(0, 1, 2))
                 _, (dq, dk, dv) = gfn(q, k, v)
+                dq.asnumpy()  # sync
                 slow_cell = SlowCell(causal=(sparse == 2))
                 sfn = ms.value_and_grad(slow_cell, grad_position=(0, 1, 2))
                 _, (sq, sk, sv) = sfn(qr, kr, vr)

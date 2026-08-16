@@ -30,56 +30,53 @@ _PLATFORM_910B = os.environ.get("LLM_SNN_IS_910B", "").strip().lower()
 def is_910b() -> bool:
     """Platform detection, multi-source so it works before/after init_ms.
 
-    Sources, in order: LLM_SNN_IS_910B env override, ms context device_name,
-    ms.hal device name. Ascend A2 (910B) reports 910B in the device name;
-    Ascend A1 (910 Pro A) reports 910 or 910A.
+    Sources, in order: LLM_SNN_IS_910B env override, ms.hal device name
+    (MS 2.7+, takes a device_id), npu-smi output parse (all versions).
+    Ascend A2 (910B2) reports 910B in the name; A1 (910 Pro A) reports 910ProA.
     """
     if _PLATFORM_910B in ("1", "true", "yes"):
         return True
     if _PLATFORM_910B in ("0", "false", "no"):
         return False
     try:
-        name = str(ms.get_context("device_name") or "")
-        upper = name.upper()
-        if "910B" in upper:
-            return True
-        if "910" in upper and "A" not in upper and "PA" not in upper:
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        n = str(ms.hal.get_device_name() or "").upper()
+        n = str(ms.hal.get_device_name(0) or "").upper()
         if "910B" in n:
             return True
         if "910" in n and "A" not in n and "PA" not in n:
             return True
     except Exception:  # noqa: BLE001
         pass
+    smi = _npu_smi_text()
+    if "910B" in smi:
+        return True
     return False
+
+
+def _npu_smi_text() -> str:
+    try:
+        import subprocess
+        r = subprocess.run(["npu-smi", "info"], capture_output=True, text=True,
+                           timeout=30)
+        return (r.stdout or r.stderr or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def init_ms(mode: str = "graph") -> None:
     """One-time MindSpore init. mode: "graph" (training) or "pynative" (chat).
 
-    On 910 Pro A (MS 2.2) only set_context exists (no set_device); both 2.2
-    and 2.7 accept set_context. Device target: Ascend if available, else CPU
-    (for parity tests / local runs).
+    MS 2.7 has ms.set_device (device_target via set_context is deprecated);
+    MS 2.2 (910 Pro A) only has set_context. Both accept set_context(mode=...).
     """
-    try:
-        from mindspore import hal
-        hal.ascend.set_device(0)
-    except Exception:  # noqa: BLE001
-        pass
     target = "Ascend"
     if not is_ascend_available():
         target = "CPU"
-    ms_mode = context.GRAPH_MODE if mode == "graph" else context.PYNATIVE_MODE
-    context.set_context(mode=ms_mode, device_target=target)
-    # deterministic-free performance defaults
     try:
-        context.set_context(enable_compile_cache=False)
-    except Exception:  # noqa: BLE001
-        pass
+        ms.set_device(target)   # MS >= 2.3-ish; absent on 2.2
+    except AttributeError:
+        context.set_context(device_target=target)
+    ms_mode = context.GRAPH_MODE if mode == "graph" else context.PYNATIVE_MODE
+    context.set_context(mode=ms_mode)
 
 
 def is_ascend_available() -> bool:
@@ -110,8 +107,18 @@ def enable_loss_scaler() -> bool:
 
 
 def memory_available_mb() -> float | None:
-    """Approx. free device memory in MB, best effort. None if unknown."""
+    """Approx. device HBM total/free in MB via npu-smi; None if unknown."""
     try:
-        return float(ms.get_context("max_device_memory")) / (1024 * 1024)
+        best = None
+        for line in _npu_smi_text().splitlines():
+            import re
+            pairs = re.findall(r"(\d+)\s*/\s*(\d+)", line)
+            if pairs:
+                used, total = int(pairs[-1][0]), int(pairs[-1][1])
+                if total > 0 and (best is None or total > best[1]):
+                    best = (used, total)
+        if best is None:
+            return None
+        return float(best[1] - best[0])
     except Exception:  # noqa: BLE001
         return None
