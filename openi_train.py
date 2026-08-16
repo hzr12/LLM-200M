@@ -36,12 +36,19 @@ Usage (在启智云脑上，创建训练任务时的启动命令)：
 本地调试（未安装 c2net 或未运行在云脑环境）：
     python openi_train.py --mode pretrain --data-dir data \
         --out-dir runs/moe-200m --total-tokens 50000000 --ctx 512
+
+平台“停止任务”会强杀容器：结束时那一次 upload_output() 根本没机会执行，
+输出永远不会回传。因此训练期间会按 --upload-interval 周期性上传 output_path
+（MOXING 模式真正回传；MOUNT 模式为 no-op，挂载本身自动同步），最坏只丢
+一个上传区间。输出目录无变化时跳过上传，避免空跑 5GB。
 """
 import argparse
 import os
 import shlex
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 
@@ -128,6 +135,58 @@ def resolve_c2net_ctx():
         return None
 
 
+def _dir_changed_since(out_dir: str, mark: float | None) -> bool:
+    """输出目录里是否有文件在 mark 之后被写入（mark=None → 视为已变化）。"""
+    if mark is None:
+        return True
+    try:
+        for name in os.listdir(out_dir):
+            try:
+                if os.path.getmtime(os.path.join(out_dir, name)) > mark:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return True
+    return False
+
+
+def _start_periodic_upload(out_dir: str, interval_s: int) -> threading.Thread | None:
+    """后台守护线程：每 interval_s 秒调用一次 upload_output()。
+
+    平台“停止任务”是强杀容器，openi_train 结束时的那次 upload_output() 可能
+    永远执行不到；定期上传保证已保存的 checkpoint 已经躺在 OBS 上。输出目录
+    自上次上传以来无变化时跳过（避免反复空传 5GB）。失败只记日志不影响训练。
+    """
+    if interval_s <= 0 or not out_dir:
+        return None
+    try:
+        from c2net.context import upload_output
+    except ImportError:
+        return None
+
+    state = {"mark": None}
+
+    def _loop():
+        while True:
+            time.sleep(interval_s)
+            if not _dir_changed_since(out_dir, state["mark"]):
+                continue
+            try:
+                upload_output()
+                state["mark"] = time.time()
+                print(f"[openi] periodic output upload OK (interval {interval_s}s)",
+                      flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[openi] periodic upload failed (non-fatal): {e}",
+                      file=sys.stderr, flush=True)
+
+    t = threading.Thread(target=_loop, name="c2net-periodic-upload", daemon=True)
+    t.start()
+    print(f"[openi] periodic output upload every {interval_s}s (0=disable)", flush=True)
+    return t
+
+
 def main():
     # 在启动底层训练脚本前，先绕过 Ascend CANN RC/alpha 版残缺的
     # custom_transformer 算子包（见 _disable_custom_transformer_opp 注释）。
@@ -144,6 +203,10 @@ def main():
                          "dataset_path/LLM）。若你的训练数据就在数据集根目录，传空字符串 ''")
     ap.add_argument("--out-dir", default=None,
                     help="本地调试用：输出目录（云脑上自动由 output_path 覆盖）")
+    ap.add_argument("--upload-interval", type=int, default=1800,
+                    help="训练期间周期性 upload_output 的间隔秒数（默认 1800s；"
+                         "0=关闭。平台停止任务是强杀容器，结束时那次回传可能"
+                         "执行不到，定期上传保证 checkpoint 不丢）")
     ap.add_argument("--init-from", default=None,
                     help="SFT/续训权重文件。云脑上优先在 pretrain_model_path 下查找")
     args, unknown = ap.parse_known_args()
@@ -175,6 +238,9 @@ def main():
 
         # 确保输出目录存在（云脑上 output_path 可能尚未创建）
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        # 训练期间周期性回传（“停止任务”强杀容器时结束时那次 upload 跑不到）
+        _start_periodic_upload(out_dir, args.upload_interval)
 
         if init_from:
             init_from = _resolve_init_from(init_from, ctx)
