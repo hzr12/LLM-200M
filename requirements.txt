@@ -19,3 +19,4 @@ matplotlib>=3.8
 truststore>=0.9
 fastapi>=0.110
 uvicorn>=0.29
+flash-attn>=0.1.0
