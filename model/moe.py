@@ -72,10 +72,10 @@ class RMSNorm(nn.Module):
             return False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 探测不在 forward 里做：Model.forward 在 checkpoint 帧外一次性探测并
+        # 缓存 _npu_rms_ok；帧内探测会把 probe 图的保存张量注入 frame 1
+        # （FWD 53 vs REC 50 的根因）。这里只读缓存。
         if x.device.type == "npu" and x.dtype in (torch.float16, torch.bfloat16):
-            if RMSNorm._npu_rms_ok is None:
-                RMSNorm._npu_rms_ok = self._probe_npu_rms_norm(
-                    x, self.weight.to(x.dtype), self.eps)
             if RMSNorm._npu_rms_ok:
                 try:
                     import torch_npu  # noqa: F401
@@ -84,7 +84,12 @@ class RMSNorm(nn.Module):
                     return out[0] if isinstance(out, tuple) else out
                 except Exception:  # noqa: BLE001
                     RMSNorm._npu_rms_ok = False  # 运行时失败 → 全局回退
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        # 逐元素路径：rms 链显式 fp32（与 npu_rms_norm 分支的精度对齐；在
+        # autocast(enabled=False) 下 pow/mul 不再被包装提升，必须显式 .float()，
+        # 否则 fp16 计算 rms 精度不足）。x 与 weight 的混乘显式 cast 到 x.dtype，
+        # 避免 fp16×fp32 提升产生与重算不一致的路径。
+        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms.to(x.dtype) * self.weight.to(x.dtype)
 
 
 def precompute_rope(head_dim: int, seq_len: int, theta: float,
@@ -659,44 +664,68 @@ class MoETransformer(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None) -> tuple[torch.Tensor, dict]:
         """idx: [B, T]. Returns (logits, extra_losses)."""
-        B, T = idx.shape
-        x = self.token_embedding(idx)
-        # autocast 下 Embedding 输出保持 fp32（torch 标准行为，不参与降级）；
-        # torch_npu 2.1 的 autocast 只 cast 权重不 cast fp32 输入 → 整条激活链
-        # 会以 fp32 传播（[S,D] 小 cast 每层重复）。在 autocast 上下文里手动把
-        # embedding 输出降到 fp16，消除 fp32 激活链。
-        # 注意：torch 2.1 的 torch.is_autocast_enabled() 无参且只查 CUDA 状态
-        # （NPU autocast 下恒 False，带参调用直接 TypeError）——NPU 训练统一
-        # 约定在 amp_context（autocast）内执行，故用 device+training 推断。
-        if (torch.is_autocast_enabled()
-                or (idx.device.type == "npu" and self.training)):
-            x = x.to(torch.float16)
-        cos, sin = self._rope(T, idx.device, x.dtype)
-        losses = {"router_z_loss": torch.zeros((), device=idx.device),
-                  "router_aux_loss": torch.zeros((), device=idx.device)}
-        n_layers = len(self.layers)
-        for layer in self.layers:
-            if self.cfg.gradient_checkpointing and self.training:
-                # 直接把 layer 传给 checkpoint（nn.Module 可调用）。
-                # 不要用 lambda 包裹——闭包捕获循环变量在反向重算时会解析成最后一层。
-                x, ls = torch.utils.checkpoint.checkpoint(
-                    layer, x, cos, sin, use_reentrant=False)
-            else:
-                x, ls = layer(x, cos, sin)
+        # 整个前向在 autocast(enabled=False) 内执行：torch_npu 2.1 的 autocast
+        # 是 Python 层算子包装，checkpoint 重算在 autograd 引擎内不经包装 →
+        # 逐元素算子（pow/mul/rsqrt/rope 等）在重算时不会 fp32 提升，与
+        # forward 的算子序列分裂（CheckpointError 53 vs 50）。显式关闭提升后
+        # forward 与重算都走 native fp16 保 dtype 路径，代码路径完全一致；
+        # 需要 fp32 精度的地方（rms 链/softmax/router/loss）在模型内显式
+        # .float()。外层 amp_context（训练脚本）保留但不再影响算子路径。
+        with torch.autocast(device_type=idx.device.type, dtype=torch.float16,
+                            enabled=False):
+            # RMSNorm 的 npu_rms_norm 探测在 checkpoint 帧外一次性执行（首个
+            # 训练前向，idx 已在 NPU 上）。帧内探测会把 probe 图的保存张量注入
+            # frame 1，而重算时 _npu_rms_ok 已缓存、不再重跑 probe → forward
+            # 保存 53 个 vs 重算 50 个（CheckpointError 的根因）。
+            if RMSNorm._npu_rms_ok is None and idx.device.type == "npu":
+                with torch.autograd.enable_grad():
+                    RMSNorm._npu_rms_ok = RMSNorm._probe_npu_rms_norm(
+                        torch.randn(1, 4, self.cfg.d_model, device=idx.device,
+                                    dtype=torch.float16),
+                        torch.randn(self.cfg.d_model, device=idx.device,
+                                    dtype=torch.float16), 1e-5)
+            B, T = idx.shape
+            x = self.token_embedding(idx)
+            # autocast 下 Embedding 输出保持 fp32（torch 标准行为，不参与降级）；
+            # torch_npu 2.1 的 autocast 只 cast 权重不 cast fp32 输入 → 整条激活链
+            # 会以 fp32 传播（[S,D] 小 cast 每层重复）。在 autocast 上下文里手动把
+            # embedding 输出降到 fp16，消除 fp32 激活链。
+            # 注意：torch 2.1 的 torch.is_autocast_enabled() 无参且只查 CUDA 状态
+            # （NPU autocast 下恒 False，带参调用直接 TypeError）——NPU 训练统一
+            # 约定在 amp_context（autocast）内执行，故用 device+training 推断。
+            if (torch.is_autocast_enabled()
+                    or (idx.device.type == "npu" and self.training)):
+                x = x.to(torch.float16)
+            cos, sin = self._rope(T, idx.device, x.dtype)
+            losses = {"router_z_loss": torch.zeros((), device=idx.device),
+                      "router_aux_loss": torch.zeros((), device=idx.device)}
+            n_layers = len(self.layers)
+            for layer in self.layers:
+                if self.cfg.gradient_checkpointing and self.training:
+                    # 直接把 layer 传给 checkpoint（nn.Module 可调用）。
+                    # 不要用 lambda 包裹——闭包捕获循环变量在反向重算时会解析成最后一层。
+                    x, ls = torch.utils.checkpoint.checkpoint(
+                        layer, x, cos, sin, use_reentrant=False)
+                else:
+                    x, ls = layer(x, cos, sin)
+                for k in losses:
+                    losses[k] = losses[k] + ls[k]
+            # average over layers so the reported value is per-layer
             for k in losses:
-                losses[k] = losses[k] + ls[k]
-        # average over layers so the reported value is per-layer
-        for k in losses:
-            losses[k] = losses[k] / n_layers
-        x = self.norm(x)
-        logits = _ld(x, self.lm_head.weight)
-        total_loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, self.cfg.vocab_size), targets.view(-1), ignore_index=-1)
-            total_loss = (loss
-                          + self.cfg.router_z_loss_coef * losses["router_z_loss"]
-                          + self.cfg.router_aux_loss_coef * losses["router_aux_loss"])
-        return logits, losses | {"total": total_loss}
+                losses[k] = losses[k] / n_layers
+            x = self.norm(x)
+            logits = _ld(x, self.lm_head.weight)
+            total_loss = None
+            if targets is not None:
+                # logits 显式 fp32（fp16 CE 数值不稳）；loss 在 checkpoint 外，
+                # 无 forward/重算对称问题。
+                loss = F.cross_entropy(
+                    logits.float().view(-1, self.cfg.vocab_size),
+                    targets.view(-1), ignore_index=-1)
+                total_loss = (loss
+                              + self.cfg.router_z_loss_coef * losses["router_z_loss"]
+                              + self.cfg.router_aux_loss_coef * losses["router_aux_loss"])
+            return logits, losses | {"total": total_loss}
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8,
