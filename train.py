@@ -405,10 +405,13 @@ def main():
             with device_lib.amp_context(device):
                 _, losses_d = model(x, y)
                 loss = losses_d["total"] / grad_accum
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+                # backward 必须在 autocast 内：checkpoint 重算发生在
+                # backward 时，autocast 已退出会走 fp32 路径与 forward
+                # 分裂 → CheckpointError（张量保存数不一致）。
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
             running_acc += loss.detach()
             n_running += 1
         running += running_acc.item() * grad_accum

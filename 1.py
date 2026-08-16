@@ -59,7 +59,10 @@ def run_steps(model, prefetcher, device, cfg, n_steps, dtype,
         with device_lib.amp_context(device):
             logits, losses_d = model(x, y)
             loss = losses_d["total"]
-        loss.backward()
+            # backward 必须在 autocast 内：checkpoint（use_reentrant=False）
+            # 的重算发生在 backward 时，若上下文已退出，重算走 fp32 路径与
+            # forward 的 fp16 路径分裂 → CheckpointError 53 vs 50 张量。
+            loss.backward()
         if debug and i == 0:
             print(f"  [debug] tokens: x min/max = {int(x.min())}/{int(x.max())} "
                   f"| y min/max = {int(y.min())}/{int(y.max())}", flush=True)
@@ -103,7 +106,8 @@ def profiled_run(model, prefetcher, device, cfg, dtype, args):
         x, y = prefetcher.next()
         with device_lib.amp_context(device):
             _, losses_d = model(x, y)
-        losses_d["total"].backward()
+            # backward 必须在 autocast 内（checkpoint 重算依赖，见 run_steps）
+            losses_d["total"].backward()
         prof.step()
     torch.npu.synchronize()
     wall = time.time() - t0

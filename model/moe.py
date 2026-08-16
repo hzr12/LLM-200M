@@ -22,6 +22,22 @@ from .config import Config
 
 
 # --------------------------------------------------------------------------
+# mixed-precision helpers
+# --------------------------------------------------------------------------
+def _ld(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """按输入 dtype 显式 cast 权重的 linear（无 bias）。
+
+    torch_npu 2.1 的 autocast 是 Python 层算子包装：checkpoint
+    （use_reentrant=False）的重算发生在 autograd 引擎内部，不经 Python 包装
+    → 权重 cast 失效，重算走 fp32 路径与 forward 的 fp16 路径分裂
+    （CheckpointError 53 vs 50 张量）。权重 cast 显式化后 forward 与重算
+    走同一条代码路径；CPU 上 x=fp32 时 cast 为 no-op，行为不变。
+    权重保持 fp32 参数（梯度 fp32 累加），仅前向时按激活 dtype 转换。
+    """
+    return F.linear(x, w.to(x.dtype))
+
+
+# --------------------------------------------------------------------------
 # components
 # --------------------------------------------------------------------------
 
@@ -259,8 +275,9 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
-        # qkv 合并 GEMM → split（q 在前、k 中、v 后）
-        qkv = self.qkv_proj(x)
+        # qkv 合并 GEMM → split（q 在前、k 中、v 后）。权重显式按 x.dtype
+        # cast（_ld）：checkpoint 重算不经 autocast，隐式 cast 会路径分裂。
+        qkv = _ld(x, self.qkv_proj.weight)
         dq = self.n_heads * self.head_dim
         dkv = self.n_kv_heads * self.head_dim
         q, k, v = qkv.split([dq, dkv, dkv], dim=-1)
@@ -291,7 +308,7 @@ class Attention(nn.Module):
                     y = flash_attn_func(
                         q.transpose(1, 2).contiguous(), k_r.transpose(1, 2).contiguous(),
                         v_r.transpose(1, 2).contiguous(), causal=True)
-                    return self.o_proj(y.reshape(B, T, -1))
+                    return _ld(y.reshape(B, T, -1), self.o_proj.weight)
                 except ImportError:
                     pass  # flash-attn 未安装 → 走 SDPA
                 except Exception as e:  # noqa: BLE001
@@ -303,7 +320,7 @@ class Attention(nn.Module):
                 # CUDA SDPA：原生支持 GQA broadcast，直接传原始 k/v 即可
                 try:
                     y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-                    return self.o_proj(y.transpose(1, 2).reshape(B, T, -1))
+                    return _ld(y.transpose(1, 2).reshape(B, T, -1), self.o_proj.weight)
                 except Exception as e:  # noqa: BLE001
                     if not Attention._npu_fa_warned:
                         Attention._npu_fa_warned = True
@@ -324,7 +341,7 @@ class Attention(nn.Module):
                     y = next(t for t in out
                              if tuple(getattr(t, "shape", ()))
                              == (B, self.n_heads, T, self.head_dim))
-                    return self.o_proj(y.transpose(1, 2).reshape(B, T, -1))
+                    return _ld(y.transpose(1, 2).reshape(B, T, -1), self.o_proj.weight)
                 except Exception as e:  # noqa: BLE001
                     # 运行时失败也全局禁用（probe 已同步验证过，这里只是兜底）
                     Attention._npu_fa_ok = False
@@ -340,20 +357,29 @@ class Attention(nn.Module):
         v = v.repeat_interleave(self.repeats, dim=1)
         # slow fallback: cached additive causal bias instead of rebuilding
         # torch.triu(torch.ones(T,T)) + masked_fill() every forward call.
+        # bias 按 att 的 dtype（q.dtype）构建：若按输入 x.dtype 而 x 为 fp32，
+        # add_() 前每次都要把 fp32 bias cast 成 att 的 dtype（[T,T] 大张量）。
         if (self._causal_bias is None
                 or self._causal_bias.shape[-1] < T
-                or self._causal_bias.dtype != x.dtype):
+                or self._causal_bias.dtype != q.dtype):
             b = torch.triu(torch.full((T, T), float("-inf"),
-                                      device=x.device, dtype=x.dtype), diagonal=1)
+                                      device=x.device, dtype=q.dtype), diagonal=1)
             self._causal_bias = b[None, None]
         # Fold the 1/sqrt(d) scale into q (O(T*D) work) instead of scaling the
         # full O(T^2) QK^T output, and add the causal bias in-place to avoid an
         # extra O(T^2) allocation per layer per micro-batch.
         att = (q * self._scale) @ k.transpose(-2, -1)
         att.add_(self._causal_bias[..., :T, :T])
-        att = F.softmax(att, dim=-1).to(v.dtype)
+        # CANN 的 autocast 会把 softmax 提升到 fp32 计算（输出 fp32），随后
+        # .to(v.dtype) 与 backward 各产生一次 [B,H,T,T] 大 cast（~2.3ms，
+        # 每层 fwd+重算+backward 共 5 次，占 kernel ~22%）。嵌套 enabled=False
+        # 让 softmax 保持 fp16（kernel 本身保持输入 dtype——softmax_probe 实证
+        # 1) 与 3) 均 fp16）；CUDA/CPU autocast 无 softmax 提升，嵌套无害。
+        with torch.autocast(device_type=x.device.type, dtype=torch.float16,
+                            enabled=False):
+            att = F.softmax(att, dim=-1).to(v.dtype)
         y = (att @ v).transpose(1, 2).reshape(B, T, -1)
-        return self.o_proj(y)
+        return _ld(y, self.o_proj.weight)
 
 
 class SwiGLU(nn.Module):
@@ -364,7 +390,8 @@ class SwiGLU(nn.Module):
         self.down = nn.Linear(hidden, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        g = _ld(x, self.gate.weight)
+        return _ld(F.silu(g) * _ld(x, self.up.weight), self.down.weight)
 
 
 class Expert(nn.Module):
@@ -522,8 +549,10 @@ class MoEBlock(nn.Module):
             self.refresh_expert_cache()
         W_gu, W_down = self._expert_cache                    # [2*E*H, D] / [D, E*H]
 
-        # --- 固定 shape 大 GEMM：gate/up 合并一次算全部专家（autocast 下 fp16）---
-        gu_all = F.linear(flat, W_gu)                        # [S, 2*E*H]
+        # --- 固定 shape 大 GEMM：gate/up 合并一次算全部专家。W_gu/W_down 是
+        # fp32 权重缓存，显式按激活 dtype cast（_ld）：checkpoint 重算不经
+        # autocast，隐式 cast 会走 fp32 路径与 forward 分裂 → CheckpointError。---
+        gu_all = _ld(flat, W_gu)                              # [S, 2*E*H]
         g_all, u_all = gu_all.chunk(2, dim=-1)
         g = g_all.view(S, E, H)
         u = u_all.view(S, E, H)
@@ -534,7 +563,7 @@ class MoEBlock(nn.Module):
         w = (onehot * top_probs.unsqueeze(-1)).sum(dim=1)   # [S, E]
         a = a * w.unsqueeze(-1)                            # mask 掉未选中专家
 
-        y = F.linear(a.reshape(S, E * H), W_down)          # [S, D]
+        y = _ld(a.reshape(S, E * H), W_down)                 # [S, D]
         y = y.reshape(B, T, D)
 
         if self.n_shared_experts > 0:
@@ -632,6 +661,16 @@ class MoETransformer(nn.Module):
         """idx: [B, T]. Returns (logits, extra_losses)."""
         B, T = idx.shape
         x = self.token_embedding(idx)
+        # autocast 下 Embedding 输出保持 fp32（torch 标准行为，不参与降级）；
+        # torch_npu 2.1 的 autocast 只 cast 权重不 cast fp32 输入 → 整条激活链
+        # 会以 fp32 传播（[S,D] 小 cast 每层重复）。在 autocast 上下文里手动把
+        # embedding 输出降到 fp16，消除 fp32 激活链。
+        # 注意：torch 2.1 的 torch.is_autocast_enabled() 无参且只查 CUDA 状态
+        # （NPU autocast 下恒 False，带参调用直接 TypeError）——NPU 训练统一
+        # 约定在 amp_context（autocast）内执行，故用 device+training 推断。
+        if (torch.is_autocast_enabled()
+                or (idx.device.type == "npu" and self.training)):
+            x = x.to(torch.float16)
         cos, sin = self._rope(T, idx.device, x.dtype)
         losses = {"router_z_loss": torch.zeros((), device=idx.device),
                   "router_aux_loss": torch.zeros((), device=idx.device)}
@@ -650,7 +689,7 @@ class MoETransformer(nn.Module):
         for k in losses:
             losses[k] = losses[k] / n_layers
         x = self.norm(x)
-        logits = self.lm_head(x)
+        logits = _ld(x, self.lm_head.weight)
         total_loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, self.cfg.vocab_size), targets.view(-1), ignore_index=-1)
@@ -662,11 +701,19 @@ class MoETransformer(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 0.8,
                  top_k: int = 40, eos_id: int | None = None) -> torch.Tensor:
-        """Autoregressive sampling (prompt-kv-cache optional; simple full-context version)."""
+        """Autoregressive sampling (prompt-kv-cache optional; simple full-context version).
+
+        NPU 推理走 fp16（与训练一致，避免 fp32 激活链）；CPU 保持 fp32。
+        """
         self.eval()
+        dev_type = idx.device.type
         for _ in range(max_new_tokens):
             seq = idx if idx.shape[1] <= self.cfg.max_seq_len else idx[:, -self.cfg.max_seq_len:]
-            logits, _ = self(seq)
+            if dev_type == "npu":
+                with torch.autocast(device_type="npu", dtype=torch.float16):
+                    logits, _ = self(seq)
+            else:
+                logits, _ = self(seq)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
