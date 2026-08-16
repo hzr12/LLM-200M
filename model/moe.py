@@ -403,10 +403,13 @@ class Router(nn.Module):
 
     def forward(self, x: torch.Tensor, use_aux_loss: bool = True) -> RouterOutput:
         logits = self.proj(x)                     # [B*T, E]
-        probs = F.softmax(logits.float(), dim=-1)
+        # 同一 logits 只转 fp32 一次（softmax 与 z_loss 共用）：
+        # 每层每次调用少一次 [S, E] cast，fwd+重算 12 层 = 每步少 24 次 cast。
+        flogits = logits.float()
+        probs = F.softmax(flogits, dim=-1)
         top_probs, top_idx = torch.topk(probs, k=self.top_k, dim=-1)
 
-        z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean() if use_aux_loss else torch.zeros((), device=x.device)
+        z_loss = torch.logsumexp(flogits, dim=-1).pow(2).mean() if use_aux_loss else torch.zeros((), device=x.device)
 
         aux_loss = torch.zeros((), device=x.device)
         if use_aux_loss and self.training:
