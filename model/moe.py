@@ -171,8 +171,8 @@ class Attention(nn.Cell):
                 input_layout="BNSD", sparse_mode=self._sparse_mode)
             y = out[0] if isinstance(out, tuple) else out
         else:
-            k = ops.repeat_interleave(k, self.repeats, dim=1)
-            v = ops.repeat_interleave(v, self.repeats, dim=1)
+            k = k.repeat_interleave(self.repeats, dim=1)
+            v = v.repeat_interleave(self.repeats, dim=1)
             att = ops.matmul(q * self._scale, k.swapaxes(-2, -1))
             att = att + self._causal_bias[..., :T, :T]
             p = ops.softmax(att, axis=-1)
@@ -202,7 +202,7 @@ class Router(nn.Cell):
         logits = _ld(x, self.router_w)          # [S, E] act dtype
         flogits = logits.float()
         probs = ops.softmax(flogits, axis=-1)
-        top_probs, top_idx = ops.topk(probs, self.top_k, dim=-1)
+        top_probs, top_idx = ops.topk(probs, self.top_k, -1)
         z_loss = ops.pow(ops.logsumexp(flogits, axis=-1), 2.0).mean()
         S = probs.shape[0]
         probs_sum = probs.sum(axis=0)           # [E]
@@ -429,7 +429,7 @@ class MoETransformer(nn.Cell):
             logits, _, _ = self(idx)
             lf = logits[:, -1, :].float() / temperature
             if top_k > 0:
-                v, _ = ops.topk(lf, min(top_k, lf.shape[-1]), dim=-1)
+                v, _ = ops.topk(lf, min(top_k, lf.shape[-1]), -1)
                 lf = ops.masked_fill(lf, lf < v[:, -1:], float("-inf"))
             probs = ops.softmax(lf, axis=-1)
             nxt = self._sample(probs)

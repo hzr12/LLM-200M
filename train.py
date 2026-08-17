@@ -1,29 +1,18 @@
-"""Pre-train the 200M-A25M MoE from scratch on data/train.bin.
+"""Pre-train the 200M-A25M MoE (MindSpore) on data/train.bin.
 
-Usage (NPU, full-speed):
+Usage (910B, full-speed):
     python train.py --total-tokens 2800000000 \
-                    --batch-size 32 --micro-batch 16 --ctx 2048 \
-                    --flash-attention --gradient-checkpointing 0 \
-                    --out-dir runs/moe-200m
-    # --fa-layout bsh to switch npu_fusion_attention layout (default bnsd)
+                    --batch-size 32 --micro-batch 32 --ctx 2048 \
+                    --flash-attention --out-dir runs/moe-200m
+    # 910 Pro A (fp16 + 手动 LossScaler，无融合算子)：
+    python train.py --total-tokens 2800000000 --batch-size 32 --micro-batch 32 \
+                    --ctx 2048 --out-dir runs/moe-200m
 
-Data format (nanoGPT style):
-    data/train.bin / data/val.bin : uint16 token stream (memmap)
-    data/meta.json                : vocab_size, special_ids
-
-Key details:
-  - bf16 AMP (GPU) / fp32 fallback (CPU)
-  - AdamW with cosine LR + warmup; min_lr = lr * 0.1
-  - grad accumulation + gradient clipping
-  - checkpoints every --save-every steps (also keep best-val)
-  - MoE router z/aux losses are added to the cross-entropy
-  - speed tricks (all enabled by default):
-      * async micro-batch prefetch (DataPrefetcher) overlaps H2D copies
-        with compute
-      * fused per-expert weight caches are rebuilt once per optimizer step
-        instead of cat()-ed every forward call
-      * NPU + --flash-attention: gradient-checkpointing auto-disables (FA frees
-        HBM); override with --gradient-checkpointing 1/0
+CLI 与 torch 版本保持兼容（openi_train.py 按原参数调用）。仅保留语义的开关
+（--gradient-checkpointing/--fa-layout/--sparse-moe）照常接受但不改变行为：
+  - MS 版无 checkpoint 重计算（图模式），内存压力靠 micro-batch 控制；
+  - FA 布局固定 BNSD（910B MS 2.7 的 flash_attention_score）；
+  - sparse/dense MoE 已统一为 dense-mask 大 GEMM。
 """
 import argparse
 import json
@@ -35,22 +24,18 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+import mindspore as ms
+from mindspore import context, nn, ops
 
 sys.path.insert(0, str(Path(__file__).parent))
 import device as device_lib  # noqa: E402
 from model import Config, MoETransformer  # noqa: E402
+from model.moe import Attention  # noqa: E402
 
 
 def _str2bool(v):
-    """Parse a boolean CLI value.
-
-    Accepts both the bare-flag style (``--flag``, handled via nargs='?'
-    + const) and explicit values: ``--flag 1``, ``--flag 0``,
-    ``--flag True``, ``--flag=False``, ``--flag on/off`` ... This lets
-    training-platform parameter forms (which require a value) work the
-    same as local command lines.
-    """
+    """Parse a boolean CLI value (bare flag or key=value forms)."""
     if isinstance(v, bool):
         return v
     s = str(v).strip().lower()
@@ -58,137 +43,159 @@ def _str2bool(v):
         return True
     if s in ("0", "false", "no", "n", "off"):
         return False
-    raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r} (use 1/0/true/false)")
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
 
 
-def get_batch(mmap, idx, bs, ctx, device):
-    starts = torch.randint(0, len(mmap) - ctx - 1, (bs,))
-    x = torch.stack([torch.from_numpy(mmap[s:s + ctx].astype(np.int64)) for s in starts])
-    y = torch.stack([torch.from_numpy(mmap[s + 1:s + ctx + 1].astype(np.int64)) for s in starts])
-    return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-
-
+# --------------------------------------------------------------------------
+# data
+# --------------------------------------------------------------------------
 class DataPrefetcher:
-    """Prefetch the next micro-batch on a side stream.
+    """Host-side numpy batch prefetcher (columns of (memmap, shift))."""
 
-    The host->device copies of micro-batch N+1 are queued while micro-batch N
-    is still computing, hiding the transfer latency. Falls back to a plain
-    synchronous fetch when side streams are unavailable (e.g. CPU).
-
-    ``cols`` is an iterable of ``(memmap, shift)``: each column reads
-    ``memmap[s+shift : s+shift+ctx]`` for a random start ``s`` shared across
-    all columns. Pre-train uses ``[(train, 0), (train, 1)]`` for (x, y); SFT
-    adds a third mask column ``[(data, 0), (data, 1), (mask, 1)]``.
-    ``next()`` returns a list with one tensor per column.
-    """
-
-    def __init__(self, cols, bs, ctx, device):
+    def __init__(self, cols, bs, ctx, rng):
         self.cols = list(cols)
         self.bs = bs
         self.ctx = ctx
-        self.device = torch.device(device)
-        self._stream = None
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            self._stream = torch.cuda.Stream()
-        elif self.device.type == "npu":
-            try:
-                import torch_npu  # noqa: F401
-                if hasattr(torch, "npu") and hasattr(torch.npu, "stream"):
-                    self._stream = torch.npu.Stream()
-            except (ImportError, AttributeError, RuntimeError):
-                self._stream = None
+        self.rng = rng
         self._next = None
         self.prefetch()
 
     def _load(self):
-        bs, ctx = self.bs, self.ctx
         n = len(self.cols[0][0])
-        starts = torch.randint(0, n - ctx - 1, (bs,))
+        starts = self.rng.integers(0, n - self.ctx - 1, self.bs)
         out = []
         for mmap, shift in self.cols:
-            out.append(torch.stack(
-                [torch.from_numpy(mmap[s + shift:s + shift + ctx].astype(np.int64))
-                 for s in starts.tolist()]))
+            out.append(np.stack(
+                [mmap[s + shift:s + shift + self.ctx] for s in starts])
+                .astype(np.int32))
         return out
 
-    def _copy(self, cols):
-        return [c.to(self.device, non_blocking=True) for c in cols]
-
     def prefetch(self):
-        cols = self._load()  # sync CPU work (small); copy below is async
-        if self._stream is None:
-            self._next = self._copy(cols)
-            return
-        if self.device.type == "cuda":
-            with torch.cuda.stream(self._stream):
-                self._next = self._copy(cols)
-        else:
-            with torch.npu.stream(self._stream):
-                self._next = self._copy(cols)
+        self._next = self._load()
 
     def next(self):
-        # make sure the previous prefetch finished before handing the batch out
-        if self._stream is not None:
-            if self.device.type == "cuda":
-                torch.cuda.current_stream().wait_stream(self._stream)
-            else:
-                torch.npu.current_stream().wait_stream(self._stream)
         batch = self._next
-        self.prefetch()  # start loading the following micro-batch now
+        self.prefetch()
         return batch
 
 
-@torch.no_grad()
-def estimate_val(model, val_mmap, cfg, bs, ctx, device, steps=20):
-    model.eval()
-    losses, router_losses = [], []
-    rng = random.Random(1234)
+# --------------------------------------------------------------------------
+# loss cells
+# --------------------------------------------------------------------------
+class LossCell(nn.Cell):
+    """CE(+router losses) with an in-graph loss scale Parameter (fp16 scaler).
+
+    scale is a non-trainable Parameter updated host-side via set_data, so the
+    train graph stays static; grads come back pre-scaled and are divided
+    host-side before clipping.
+    """
+
+    def __init__(self, model: MoETransformer, cfg: Config, sft: bool = False):
+        super().__init__()
+        self.model = model
+        self.sft = sft
+        self.ce = nn.CrossEntropyLoss(ignore_index=-1,
+                                      reduction="none" if sft else "mean")
+        self.zc = cfg.router_z_loss_coef
+        self.ac = cfg.router_aux_loss_coef
+        self.scale = ms.Parameter(ms.Tensor([1.0], ms.float32),
+                                  name="loss_scale", requires_grad=False)
+
+    def construct(self, idx, targets, mask=None):
+        logits, z, a = self.model(idx)
+        ce = self.ce(logits.float().reshape(-1, logits.shape[-1]),
+                     targets.reshape(-1))
+        if self.sft:
+            B = targets.shape[0]
+            ce = (ce.reshape(B, -1) * mask).sum() / mask.sum()
+        total = (ce + self.zc * z + self.ac * a) * self.scale
+        return total
+
+
+class EvalCell(nn.Cell):
+    """Unscaled loss for validation (train/eval share one model graph)."""
+
+    def __init__(self, model: MoETransformer, cfg: Config, sft: bool = False):
+        super().__init__()
+        self.model = model
+        self.sft = sft
+        self.ce = nn.CrossEntropyLoss(ignore_index=-1,
+                                      reduction="none" if sft else "mean")
+        self.zc = cfg.router_z_loss_coef
+        self.ac = cfg.router_aux_loss_coef
+
+    def construct(self, idx, targets, mask=None):
+        logits, z, a = self.model(idx)
+        ce = self.ce(logits.float().reshape(-1, logits.shape[-1]),
+                     targets.reshape(-1))
+        if self.sft:
+            B = targets.shape[0]
+            ce = (ce.reshape(B, -1) * mask).sum() / mask.sum()
+        return ce + self.zc * z + self.ac * a
+
+
+def estimate_val(model, val_mmap, cfg, bs, ctx, steps=20, seed=1234):
+    rng = random.Random(seed)
+    eval_cell = EvalCell(model, cfg)
+    losses = []
     for _ in range(steps):
         starts = [rng.randint(0, len(val_mmap) - ctx - 1) for _ in range(bs)]
-        x = torch.stack([torch.from_numpy(val_mmap[s:s + ctx].astype(np.int64)) for s in starts])
-        y = torch.stack([torch.from_numpy(val_mmap[s + 1:s + ctx + 1].astype(np.int64)) for s in starts])
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-        with device_lib.amp_context(device):
-            _, losses_d = model(x, y)
-        losses.append(losses_d["total"].item())
-        router_losses.append((losses_d["router_z_loss"].item(), losses_d["router_aux_loss"].item()))
-    model.train()
-    return (sum(losses) / len(losses),
-            sum(z for z, _ in router_losses) / len(router_losses),
-            sum(a for _, a in router_losses) / len(router_losses))
+        x = np.stack([val_mmap[s:s + ctx] for s in starts]).astype(np.int32)
+        y = np.stack([val_mmap[s + 1:s + ctx + 1] for s in starts]).astype(np.int32)
+        losses.append(float(eval_cell(ms.Tensor(x, ms.int32),
+                                      ms.Tensor(y, ms.int32)).asnumpy()))
+    return sum(losses) / len(losses)
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+# --------------------------------------------------------------------------
+# checkpoint helpers
+# --------------------------------------------------------------------------
+def load_npz_into_model(model, path: str) -> None:
+    """Load convert_ckpt.py .npz (MS-layout float32 arrays) into the model."""
+    npz = np.load(path)
+    pd = {k: ms.Parameter(ms.Tensor(npz[k], ms.float32), name=k)
+          for k in npz.files}
+    ms.load_param_into_net(model, pd)
+    print(f"loaded weights from {path} ({len(npz.files)} params)")
 
 
-def _save_ckpt(out_dir, name: str, model, optim, step, cfg, scaler=None, loss=None, log=None):
-    """保存单个 checkpoint 到 out_dir/name（覆盖写，避免累积）。"""
-    path = out_dir / name
-    torch.save({
-        "model": model.state_dict(),
-        "optim": optim.state_dict(),
-        "step": step,
-        "cfg": cfg.__dict__,
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "loss": loss,
-    }, path)
-    msg = f"checkpoint saved -> {path}"
+def _save_ckpt(out_dir: Path, name: str, model, optim, step, cfg,
+               scale_val: float, loss=None, log=None):
+    """Save model + optimizer + meta as three files (overwrite)."""
+    ms.save_checkpoint(model, str(out_dir / f"{name}_model.ckpt"))
+    ms.save_checkpoint(optim, str(out_dir / f"{name}_optim.ckpt"))
+    meta = {"step": step, "loss": loss, "scale": scale_val, "cfg": cfg.__dict__}
+    (out_dir / f"{name}_meta.json").write_text(
+        json.dumps(meta, default=str), encoding="utf-8")
+    msg = f"checkpoint saved -> {out_dir / name}_*"
     if log:
         log(msg)
     else:
         print(msg, flush=True)
 
 
+def lr_schedule(steps: int, lr: float, warmup_steps: int,
+                total_steps: int, floor: float = 0.1) -> np.ndarray:
+    """warmup (0-based) + cosine decay to lr*floor; full numpy array."""
+    lrs = np.zeros(steps, np.float32)
+    for s in range(steps):
+        if s < warmup_steps:
+            lrs[s] = lr * s / max(1, warmup_steps)
+        else:
+            progress = min(1.0, (s - warmup_steps)
+                           / max(1, total_steps - warmup_steps))
+            lrs[s] = lr * floor + (1 - floor) * lr * 0.5 \
+                * (1 + math.cos(math.pi * progress))
+    return lrs
+
+
 def main():
     ap = argparse.ArgumentParser()
-    # data
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--ctx", type=int, default=2048)
-    # training
     ap.add_argument("--total-tokens", type=float, default=2.8e9)
-    ap.add_argument("--batch-size", type=int, default=32)      # total tokens per update = bs*ctx
-    ap.add_argument("--micro-batch", type=int, default=8)      # forward chunks for grad accum
+    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--micro-batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--warmup-tokens", type=float, default=6e7)
     ap.add_argument("--weight-decay", type=float, default=0.1)
@@ -196,32 +203,25 @@ def main():
     ap.add_argument("--beta2", type=float, default=0.95)
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--scaler-init-scale", type=float, default=1024.0,
-                    help="fp16 GradScaler 初始缩放；偏大易 overflow，偏小梯度下溢。"
-                         "默认 1024(2**10)，overflow 频繁可调小，训练不稳可调大。")
+                    help="fp16 手动 LossScaler 初始值（仅 910 Pro A 生效）")
     ap.add_argument("--dropout", type=float, default=0.0)
-    # model
     ap.add_argument("--config", default="moe-200m")
-    ap.add_argument("--init-from", default=None, help="checkpoint to resume from")
-    # 布尔参数同时支持裸写（--flag）和带值（--flag 1/0/True/False）两种写法，
-    # 方便训练平台以 key=value 传参。
+    ap.add_argument("--init-from", default=None,
+                    help="resume: 转换后的 .npz（模型权重）或本脚本保存的 "
+                         "*_model.ckpt（含优化器/step）")
     ap.add_argument("--gradient-checkpointing", type=_str2bool, default=None,
                     nargs="?", const=True, metavar="BOOL",
-                    help="激活重计算，省显存（训练变慢约 30%%，argparse help 转义）。NPU 上默认开启（32GB HBM + 全量专家激活容易 OOM）；"
-                         "CUDA/CPU 默认关闭。关闭用 --gradient-checkpointing 0 / False")
+                    help="MS 版无 checkpoint 重计算（图模式），此开关仅兼容 CLI，"
+                         "内存压力请用 --micro-batch 控制")
     ap.add_argument("--flash-attention", type=_str2bool, default=False,
                     nargs="?", const=True, metavar="BOOL",
-                    help="启用 FlashAttention（CUDA flash-attn / Ascend npu_fusion_attention）。"
-                         "可用 --flash-attention 1/0、--flash-attention True/False 显式指定；"
-                         "NPU 上建议开启，可同时提速并省显存；默认关闭")
+                    help="910B 启用 flash_attention_score（自动探针，失败降级慢注意力）；"
+                         "0 强制走慢注意力")
     ap.add_argument("--fa-layout", default="bnsd", choices=["bnsd", "bsh"],
-                    help="npufusion_attention 输入布局：bnsd=[B,N,S,D]（默认），bsh=[B,S,H]。"
-                         "部分 CANN 版本只对其中一种布局提供 kernel")
+                    help="兼容参数：MS 版固定 BNSD")
     ap.add_argument("--sparse-moe", type=_str2bool, default=None,
                     nargs="?", const=True, metavar="BOOL",
-                    help="sparse MoE 开关（语义标记）。910 Pro A 上 sparse 与 dense 已统一为 "
-                         "dense-mask 大 GEMM 架构（对所有专家一次 GEMM + top-k 权重 mask），"
-                         "两者共用同一实现，默认开启。关闭无意义但保留以兼容旧脚本。")
-    # run
+                    help="兼容参数：MS 版统一 dense-mask 架构")
     ap.add_argument("--out-dir", default="runs/moe-200m")
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--log-every", type=int, default=10)
@@ -229,113 +229,96 @@ def main():
     ap.add_argument("--save-every", type=int, default=1000)
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
-    device = device_lib.get_device()
-    device_lib.init_npu()  # NPU: 开启 JIT 编译缓存，降低首步编译台阶
+    ms.set_seed(args.seed)
 
-    # NPU 默认开启 gradient checkpointing：全量专家激活很大，32GB HBM 容易 OOM。
-    # 但若 FlashAttention 已开启（--flash-attention），省下的激活内存足够关掉重计算，
-    # 此时自动默认关闭（训练快 ~30%）。用户始终可用 --gradient-checkpointing 1/0
-    # 显式覆盖（CUDA/CPU 不受影响，默认关）。
-    if args.gradient_checkpointing is None:
-        if device.type == "npu" and args.flash_attention:
-            args.gradient_checkpointing = False
-            print("device is NPU + --flash-attention: gradient-checkpointing disabled "
-                  "(FA frees HBM; pass --gradient-checkpointing 1 to force)")
-        else:
-            args.gradient_checkpointing = (device.type == "npu")
-            if args.gradient_checkpointing:
-                print("device is NPU: gradient-checkpointing enabled by default "
-                      "(pass --gradient-checkpointing 0 to disable)")
+    device_lib.init_ms(mode="pynative")
+    on_ascend = ms.get_context("device_target") == "Ascend"
+    dtype = device_lib.amp_dtype()
+    use_scaler = device_lib.enable_loss_scaler()
+    print(f"MS {ms.__version__} target={ms.get_context('device_target')} "
+          f"dtype={dtype} scaler={use_scaler} 910b={device_lib.is_910b()} "
+          f"hbm_free={device_lib.memory_available_mb()}MB")
 
     data_dir = Path(args.data_dir)
     train_mmap = np.memmap(data_dir / "train.bin", dtype=np.uint16, mode="r")
     val_mmap = np.memmap(data_dir / "val.bin", dtype=np.uint16, mode="r")
     meta = json.loads((data_dir / "meta.json").read_text(encoding="utf-8"))
-    print(f"train tokens: {len(train_mmap):,} | val tokens: {len(val_mmap):,} | vocab: {meta['vocab_size']}")
+    print(f"train tokens: {len(train_mmap):,} | val tokens: {len(val_mmap):,} "
+          f"| vocab: {meta['vocab_size']}")
 
     cfg = Config.from_name(args.config)
     cfg.dropout = args.dropout
-    cfg.gradient_checkpointing = args.gradient_checkpointing
     cfg.use_flash_attn = args.flash_attention
-    cfg.fa_layout = args.fa_layout
-    if args.sparse_moe is not None:
-        cfg.sparse_moe = args.sparse_moe
     if meta["vocab_size"] != cfg.vocab_size:
-        print(f"note: overriding cfg.vocab_size {cfg.vocab_size} -> {meta['vocab_size']} from meta.json")
+        print(f"note: overriding cfg.vocab_size {cfg.vocab_size} -> {meta['vocab_size']}")
         cfg.vocab_size = meta["vocab_size"]
-    print(f"config: layers={cfg.n_layers} d_model={cfg.d_model} experts={cfg.n_experts} top_k={cfg.top_k}")
-    print(f"params ~ {cfg.num_parameters()}")
+    print(f"config: layers={cfg.n_layers} d_model={cfg.d_model} "
+          f"experts={cfg.n_experts} top_k={cfg.top_k} | params ~ {cfg.num_parameters()}")
 
-    model = MoETransformer(cfg).to(device)
-    # FA pre-flight 同步探测：npu_fusion_attention 是异步算子，若该 CANN 环境
-    # 没有 kernel，错误只会在 backward/拷贝等同步点爆发导致崩溃（try/except
-    # 无法捕获）。这里训练前先探测一次，不可用则自动禁用 FA 并降级。
-    if cfg.use_flash_attn and device.type == "npu":
-        # 透传真实 micro-batch：FusedAttention 的 kernel 可用性常依赖
-        # (batch, heads, seq) tiling，用 batch=1 探测通过、真实 batch 才炸的
-        # CANN 版本并不罕见，故必须按真实训练 micro-batch 探测才能说真话。
-        if not model.check_flash_attn(device, device_lib.amp_dtype(),
-                                      seq_len=args.ctx, batch=args.micro_batch):
-            print("note: npu_fusion_attention unavailable -> disabling --flash-attention", flush=True)
-            cfg.use_flash_attn = False
-            # FA 失效后激活内存回到高占用，慢速 attention + 全量专家激活在
-            # NPU 32GB HBM 上几乎必然 OOM。因此即便用户显式传过
-            # --gradient-checkpointing 0（其前提是 FA 已省下激活内存）也强制
-            # 开启，避免训练中途 OOM 崩溃。
-            if not cfg.gradient_checkpointing:
-                cfg.gradient_checkpointing = True
-                print("note: forcing gradient-checkpointing=1 (slow attention without FA "
-                      "needs it to fit NPU HBM)", flush=True)
-    nparams = count_parameters(model)
-    print(f"trainable params: {nparams/1e6:.2f}M (cfg estimate {cfg.num_parameters()['total']/1e6:.1f}M)")
-
-    # --- optimizer ------------------------------------------------------
-    decay, no_decay = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim >= 2 and "norm" not in name and "bias" not in name:
-            decay.append(p)
+    model = MoETransformer(cfg)
+    model.act_dtype = dtype
+    if on_ascend:
+        if cfg.use_flash_attn:
+            model.probe_fused_ops(args.micro_batch, args.ctx, dtype)
         else:
-            no_decay.append(p)
-    optim = torch.optim.AdamW([
-        {"params": decay, "weight_decay": args.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ], lr=args.lr, betas=(args.beta1, args.beta2), fused=device_lib.optimizer_fused(device))
-    print(f"optimizer: {len(decay)} decay tensors, {len(no_decay)} no-decay tensors")
-
-    # fp16 训练必须配 GradScaler（防梯度下溢/溢出）；bf16 不需要。
-    # NPU 用 torch_npu 的 GradScaler，CUDA 用 torch.cuda.amp.GradScaler。
-    scaler = None
-    if device_lib.amp_dtype() == torch.float16:
-        try:
-            from torch.npu.amp import GradScaler
-        except ImportError:
-            from torch.cuda.amp import GradScaler
-        # fp16 动态范围小（max≈65504），MoE 路由 logits / 大激活易 overflow。
-        # 默认 init_scale=2**16 偏高，首步溢出后才回退会浪费早期 step；
-        # 降到 2**10 起步更稳，GradScaler 仍会按需增长。
-        scaler = GradScaler(init_scale=args.scaler_init_scale)
-        print(f"using GradScaler (LLM_SNN_AMP=fp16, init_scale={args.scaler_init_scale})")
+            Attention._fa_ok = False
+            print("probe: --flash-attention 0 -> slow attention", flush=True)
+    else:
+        Attention._fa_ok = False
+    model.prepare_rope_bias(args.ctx, dtype)
 
     step = 0
+    scale_val = args.scaler_init_scale if use_scaler else 1.0
+    resume_optim_pd = None
     if args.init_from:
-        ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optim.load_state_dict(ckpt["optim"])
-        step = ckpt["step"]
-        if scaler is not None and ckpt.get("scaler") is not None:
-            scaler.load_state_dict(ckpt["scaler"])
-            print(f"  restored GradScaler scale={ckpt['scaler']['scale'].item():.4e}")
-        print(f"resumed from {args.init_from} at step {step}")
+        p = str(args.init_from)
+        if p.endswith(".pt"):
+            sys.exit("torch .pt checkpoint: 先运行 convert_ckpt.py --pt ... "
+                     "--out <dir>，再把生成的 .npz 传给 --init-from")
+        if p.endswith(".npz"):
+            load_npz_into_model(model, p)
+        else:  # .ckpt saved by this script
+            ms.load_param_into_net(model, ms.load_checkpoint(p))
+            stem = Path(p).stem.replace("_model", "")
+            optim_path = Path(p).parent / f"{stem}_optim.ckpt"
+            meta_path = Path(p).parent / f"{stem}_meta.json"
+            if optim_path.exists() and meta_path.exists():
+                resume_optim_pd = ms.load_checkpoint(str(optim_path))
+                m = json.loads(meta_path.read_text(encoding="utf-8"))
+                step = int(m.get("step", 0))
+                scale_val = float(m.get("scale", scale_val))
+                print(f"resumed from {p} at step {step}")
+            else:
+                print(f"resumed model weights from {p} (no optim/meta found)")
 
     tokens_per_step = args.batch_size * args.ctx
     total_steps = int(args.total_tokens // tokens_per_step)
     grad_accum = max(1, args.batch_size // args.micro_batch)
-    print(f"tokens/step: {tokens_per_step:,} | total_steps: {total_steps} | grad_accum: {grad_accum}")
+    print(f"tokens/step: {tokens_per_step:,} | total_steps: {total_steps} "
+          f"| grad_accum: {grad_accum}")
+
+    # optimizer: per-param weight decay groups, order preserved from
+    # trainable_params() so value_and_grad grads stay aligned.
+    params = []
+    for p in model.trainable_params():
+        wd = args.weight_decay if (p.ndim >= 2 and "norm" not in p.name) else 0.0
+        params.append({"params": p, "weight_decay": wd})
+    lr_arr = lr_schedule(total_steps, args.lr,
+                         int(args.warmup_tokens // tokens_per_step),
+                         total_steps, floor=0.1)
+    optim = nn.AdamWeightDecay(params, learning_rate=ms.Tensor(lr_arr, ms.float32),
+                               beta1=args.beta1, beta2=args.beta2, eps=1e-8)
+    if resume_optim_pd is not None:
+        ms.load_param_into_net(optim, resume_optim_pd)
+        print("optimizer state restored")
+
+    # switch to graph mode AFTER probes / weight load / bias-prep
+    context.set_context(mode=context.GRAPH_MODE)
+    loss_cell = LossCell(model, cfg)
+    vg = ms.value_and_grad(loss_cell, grad_position=None,
+                           weights=model.trainable_params())
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -347,123 +330,87 @@ def main():
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-    def lr_at(s):
-        if s < args.warmup_tokens // tokens_per_step:
-            return args.lr * (s / max(1, args.warmup_tokens // tokens_per_step))
-        progress = min(1.0, (s - args.warmup_tokens // tokens_per_step) /
-                       max(1, total_steps - args.warmup_tokens // tokens_per_step))
-        return args.lr * 0.1 + 0.9 * args.lr * 0.5 * (1 + math.cos(math.pi * progress))
+    rng = np.random.default_rng(args.seed)
+    prefetcher = DataPrefetcher([(train_mmap, 0), (train_mmap, 1)],
+                                args.micro_batch, args.ctx, rng)
 
-    model.train()
-    print(f"starting training on {device}")
-    prefetcher = DataPrefetcher(
-        [(train_mmap, 0), (train_mmap, 1)], args.micro_batch, args.ctx, device)
+    # graph compile dry-run (one vg call; no weight update)
+    print("compiling train graph (first step)...", flush=True)
+    x0, y0 = prefetcher.next()
+    vg(ms.Tensor(x0, ms.int32), ms.Tensor(y0, ms.int32))
+    print("graph compiled", flush=True)
 
-    # --- NPU 编译预热（dry-run）------------------------------------------------
-    # 910 Pro A 上 CANN 对每个新 (算子, shape) 首次执行会编译二进制落盘。若直接
-    # 进训练循环，前若干 step 会卡在编译（用户观察到的"前 10 分钟编译"）。这里
-    # 用真实 batch 形状 dry-run 若干次（不更新权重、不计入日志），让 .o 落盘，
-    # 之后训练循环的首步几乎无编译开销。仅 NPU 且未 resume 时预热，避免重复。
-    if device.type == "npu" and step == 0:
-        n_warmup = 3
-        print(f"NPU compile warmup: dry-running {n_warmup} steps (no grad/opt)...",
-              flush=True)
-        t_w = time.time()
-        for _ in range(n_warmup):
-            x, y = prefetcher.next()
-            with device_lib.amp_context(device):
-                _, _ = model(x, y)
-            # 预热只需前向；但 MoE 路由/编译在前向就触发，无需 backward
-            if device.type == "npu":
-                torch.npu.synchronize()
-        print(f"warmup done in {(time.time()-t_w)/60:.1f}min; training starts now",
-              flush=True)
-
-    # 打印首步 token 数 S = micro_batch * ctx，确认 shape 恒定（避免动态 shape
-    # 触发反复编译）。后续 step 的 S 应与此一致（dataloader 已 drop_last + padding）。
-    _x0, _ = prefetcher.next()
-    S0 = _x0.shape[0] * _x0.shape[1]
-    print(f"fixed token count per micro-batch S = {S0} (B={_x0.shape[0]}, T={_x0.shape[1]})",
-          flush=True)
-    # 把这条样本放回 prefetcher（prefetcher 是无状态拉取，直接再 next 即下一条，
-    # 但为不浪费，这里复用 _x0：直接用它作为第一个 micro-batch 的一部分较复杂，
-    # 简单起见丢弃该样本，warmup 已保证编译完成，无碍。）
-    del _x0
-
-    t0 = time.time()
-    running = 0.0
+    running_t = ms.Tensor(0.0, ms.float32)
     n_running = 0
     best_val = float("inf")
+    growth_streak = 0
+    t0 = time.time()
 
     while step < total_steps:
-        # micro-batch loop with gradient accumulation
-        # 在设备上累积 loss，log 时才同步一次 .item()。原实现每 micro-batch
-        # 调一次 .item()，会强制清空 NPU 算子队列、打断 prefetch 的异步重叠。
-        running_acc = torch.zeros((), device=device)
-        for mb in range(grad_accum):
+        if use_scaler:
+            loss_cell.scale.set_data(ms.Tensor([scale_val], ms.float32))
+        acc_grads = None
+        for _ in range(grad_accum):
             x, y = prefetcher.next()
-            with device_lib.amp_context(device):
-                _, losses_d = model(x, y)
-                loss = losses_d["total"] / grad_accum
-                # backward 必须在 autocast 内：checkpoint 重算发生在
-                # backward 时，autocast 已退出会走 fp32 路径与 forward
-                # 分裂 → CheckpointError（张量保存数不一致）。
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-            running_acc += loss.detach()
-            n_running += 1
-        running += running_acc.item() * grad_accum
-
-        # gradient clipping + step
-        if scaler is not None:
-            scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        for g in optim.param_groups:
-            g["lr"] = lr_at(step)
-        if scaler is not None:
-            scaler.step(optim)
-            scaler.update()
+            loss, grads = vg(ms.Tensor(x, ms.int32), ms.Tensor(y, ms.int32))
+            if acc_grads is None:
+                acc_grads = list(grads)
+            else:
+                acc_grads = [g1 + g2 for g1, g2 in zip(acc_grads, grads)]
+        if use_scaler:
+            # 每步同步一次：fp16 必须做 overflow 检查
+            loss_scalar = float(loss.asnumpy()) / scale_val
+            if not np.isfinite(loss_scalar):
+                scale_val = max(1.0, scale_val * 0.5)
+                growth_streak = 0
+                log(f"loss overflow (scale -> {scale_val:.0f}); step skipped")
+                step += 1
+                continue
+            growth_streak += 1
+            if growth_streak >= 2000 and scale_val < 1e8:
+                scale_val *= 2.0
+                growth_streak = 0
+            grads = [g / scale_val for g in acc_grads]
         else:
-            optim.step()
-        # 权重已更新：重建融合的专家权重缓存（cat 结果），供下一轮 forward 使用
-        model.refresh_expert_caches()
-        optim.zero_grad(set_to_none=True)
+            # bf16/fp32：不逐步同步，loss 仅在 log 时一次性读回
+            grads = acc_grads
+        clipped, _ = ops.clip_by_global_norm(grads, args.grad_clip)
+        optim(clipped)
+        running_t = running_t + loss   # device-side accumulation, no sync
         step += 1
+        n_running += 1
 
         if step % args.log_every == 0:
             elapsed = time.time() - t0
             tps = tokens_per_step * step / max(elapsed, 1e-6)
-            # 附上显存占用（进程内查询），便于判断慢速/崩溃是否由显存碎片或泄漏导致
-            mem = ""
-            if device.type == "npu":
-                mem = (f" | hbm {torch.npu.memory_allocated()/1e9:.2f}/"
-                       f"{torch.npu.memory_reserved()/1e9:.2f}G")
-            elif device.type == "cuda":
-                mem = (f" | hbm {torch.cuda.memory_allocated()/1e9:.2f}/"
-                       f"{torch.cuda.memory_reserved()/1e9:.2f}G")
-            log(f"loss {running/max(1,n_running):.4f} | lr {optim.param_groups[0]['lr']:.2e} | "
-                f"{tps/1e6:.2f}M tok/s | {elapsed/60:.1f}min | {step}/{total_steps}{mem}")
-            running, n_running = 0.0, 0
+            avg_loss = float(running_t.asnumpy()) / max(1, n_running)
+            mem = (f" | hbm_free {device_lib.memory_available_mb()/1e3:.1f}G"
+                   if on_ascend else "")
+            log(f"loss {avg_loss:.4f} | "
+                f"lr {lr_arr[step-1]:.2e} | {tps/1e6:.2f}M tok/s | "
+                f"{elapsed/60:.1f}min | {step}/{total_steps}{mem}")
+            running_t = ms.Tensor(0.0, ms.float32)
+            n_running = 0
 
         if step % args.val_every == 0:
-            vloss, vz, vaux = estimate_val(model, val_mmap, cfg, args.micro_batch, args.ctx, device)
-            log(f"val loss {vloss:.4f} (z {vz:.4f}, aux {vaux:.4f})")
+            vloss = estimate_val(model, val_mmap, cfg,
+                                 args.micro_batch, args.ctx)
+            log(f"val loss {vloss:.4f} (incl. router losses)")
             if vloss < best_val:
                 best_val = vloss
-                _save_ckpt(out_dir, "ckpt_best.pt", model, optim, step, cfg,
-                           scaler=scaler, loss=vloss, log=log)
+                _save_ckpt(out_dir, "ckpt_best", model, optim, step, cfg,
+                           scale_val, loss=vloss, log=log)
                 log(f"new best val loss {vloss:.4f}")
 
         if step % args.save_every == 0:
-            # 只保留最新的 last checkpoint，避免累积大量文件（云脑回传友好）
-            _save_ckpt(out_dir, "ckpt_last.pt", model, optim, step, cfg,
-                       scaler=scaler, loss=running / max(1, n_running), log=log)
+            save_loss = (float(running_t.asnumpy()) / max(1, n_running)
+                         if n_running > 0 else None)
+            _save_ckpt(out_dir, "ckpt_last", model, optim, step, cfg,
+                       scale_val, loss=save_loss, log=log)
 
-    # final: last checkpoint 即训练终点，best 已在上面按需保存
-    _save_ckpt(out_dir, "ckpt_last.pt", model, optim, step, cfg, scaler=scaler, log=log)
-    print(f"done. last checkpoint -> {out_dir / 'ckpt_last.pt'} (best -> {out_dir / 'ckpt_best.pt'})")
+    _save_ckpt(out_dir, "ckpt_last", model, optim, step, cfg, scale_val, log=log)
+    print(f"done. last checkpoint -> {out_dir / 'ckpt_last_*'} "
+          f"(best -> {out_dir / 'ckpt_best_*'})")
 
 
 if __name__ == "__main__":

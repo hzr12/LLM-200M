@@ -1,25 +1,21 @@
-"""Chat inference + tool-calling loop for the fine-tuned MoE.
+"""Chat inference + tool-calling loop for the fine-tuned MoE (MindSpore).
 
 Usage:
-    python chat.py --checkpoint runs/moe-200m-sft/sft_best.pt
+    python chat.py --checkpoint runs/moe-200m-sft/sft_best_model.ckpt
     python chat.py --checkpoint ... --prompt "帮我算一下 3+5*2"   # single-shot
-
-The model uses ChatML with reserved tokens:
-    <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>
-Tool calls are emitted as:
-    <|im_start|>assistant\n<|tool_call|>{"name": "...", "arguments": {...}}<|im_end|>
-Tool results are fed back wrapped with <|tool_result|>.
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
-import torch
+import numpy as np
+
+import mindspore as ms
 
 sys.path.insert(0, str(Path(__file__).parent))
-import device as device_lib
-from model import Config, MoETransformer
+import device as device_lib  # noqa: E402
+from model import Config, MoETransformer  # noqa: E402
 
 
 def build_prompt(messages: list[dict]) -> str:
@@ -39,7 +35,6 @@ def parse_tool_call(text: str):
     if marker not in text:
         return None
     seg = text.split(marker, 1)[1].strip()
-    # JSON is usually the last {...} in the segment
     start, end = seg.find("{"), seg.rfind("}")
     if start == -1 or end == -1:
         return None
@@ -50,15 +45,10 @@ def parse_tool_call(text: str):
 
 
 class ToolExecutor:
-    def __init__(self):
-        pass
-
     def run(self, name: str, arguments: dict) -> str:
         if name == "calculator":
-            expr = str(arguments.get("expression", ""))
-            expr = expr.replace("^", "**")
+            expr = str(arguments.get("expression", "")).replace("^", "**")
             try:
-                # safe eval: only numbers/operators
                 import re
                 expr2 = re.sub(r"[^0-9+\-*/%()., eE ]", "", expr)
                 val = eval(expr2, {"__builtins__": {}}, {})
@@ -76,24 +66,18 @@ class ToolExecutor:
         return "ERROR: unknown tool"
 
 
-@torch.no_grad()
 def run_conversation(model, tok, args, messages: list[dict]) -> str:
-    """One full turn: model may emit tool call(s), executor runs them, loop until final answer."""
+    """One full turn: model may emit tool call(s), executor runs them, loop."""
     executor = ToolExecutor()
     max_iters = 4
     for _ in range(max_iters):
         prompt = build_prompt(messages)
         ids = tok.encode(prompt, out_type=int)
-        idx = torch.tensor([ids], dtype=torch.long, device=next(model.parameters()).device)
+        idx = ms.Tensor(np.asarray([ids], np.int32), ms.int32)
         generated = model.generate(
-            idx,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            eos_id=None,  # rely on <|im_end|> stop below
-        )
-        new_tokens = generated[0, len(ids):].tolist()
-        # stop at first <|im_end|>
+            idx, max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature, top_k=args.top_k, eos_id=None)
+        new_tokens = generated.asnumpy()[0, len(ids):].tolist()
         im_end_id = tok.piece_to_id("<|im_end|>")
         text_ids = []
         for t in new_tokens:
@@ -104,14 +88,13 @@ def run_conversation(model, tok, args, messages: list[dict]) -> str:
 
         tool_call = parse_tool_call(reply)
         if tool_call is None:
-            # final answer
             messages.append({"role": "assistant", "content": reply})
             return reply
 
-        # run tool, push result back
         name, args_ = tool_call.get("name"), tool_call.get("arguments", {})
         result = executor.run(name, args_ if isinstance(args_, dict) else {})
-        messages.append({"role": "assistant", "content": f"<|tool_call|>{json.dumps(tool_call, ensure_ascii=False)}"})
+        messages.append({"role": "assistant",
+                         "content": f"<|tool_call|>{json.dumps(tool_call, ensure_ascii=False)}"})
         messages.append({"role": "tool", "content": result})
         print(f"  [tool] {name}({json.dumps(args_, ensure_ascii=False)}) -> {result[:80]}", flush=True)
     return "(tool loop limit reached)"
@@ -119,7 +102,7 @@ def run_conversation(model, tok, args, messages: list[dict]) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default="runs/moe-200m-sft/sft_best.pt")
+    ap.add_argument("--checkpoint", default="runs/moe-200m-sft/sft_best_model.ckpt")
     ap.add_argument("--sp-model", default="tokenizer/spm.model")
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--max-new-tokens", type=int, default=512)
@@ -130,13 +113,25 @@ def main():
     import sentencepiece as spm
     tok = spm.SentencePieceProcessor(model_file=args.sp_model)
 
-    device = device_lib.get_device()
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = Config(**{k: v for k, v in ckpt["cfg"].items() if k in Config().__dict__})
-    model = MoETransformer(cfg).to(device)
-    model.load_state_dict(ckpt["model"])
-    model.eval()
-    print(f"loaded {args.checkpoint} | params {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+    device_lib.init_ms(mode="pynative")  # chat runs in PYNATIVE mode
+    ckpt_path = str(args.checkpoint)
+    if ckpt_path.endswith(".pt"):
+        sys.exit("torch .pt checkpoint: 先运行 convert_ckpt.py 转换后再指定 .ckpt/.npz")
+    if ckpt_path.endswith(".npz"):
+        from train import load_npz_into_model
+        model = MoETransformer(Config())
+        load_npz_into_model(model, ckpt_path)
+    else:
+        meta_path = Path(ckpt_path).parent / \
+            (Path(ckpt_path).stem.replace("_model", "") + "_meta.json")
+        ckpt_cfg = (json.loads(meta_path.read_text(encoding="utf-8")).get("cfg", {})
+                    if meta_path.exists() else {})
+        cfg = Config(**{k: v for k, v in ckpt_cfg.items() if hasattr(Config, k)})
+        model = MoETransformer(cfg)
+        ms.load_param_into_net(model, ms.load_checkpoint(ckpt_path))
+    nparams = sum(p.size for p in model.trainable_params())
+    print(f"loaded {args.checkpoint} | params {nparams/1e6:.1f}M | "
+          f"target={ms.get_context('device_target')}")
 
     if args.prompt:
         messages = [{"role": "system", "content": "你是一个有帮助的助手。当需要计算、查询时间、天气或搜索信息时，请调用相应的工具。"},

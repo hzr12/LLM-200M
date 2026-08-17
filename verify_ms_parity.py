@@ -174,15 +174,17 @@ def main():
     ms.set_seed(0)
     print(f"MS {ms.__version__} device_target={ms.get_context('device_target')}")
 
-    nplogits, npz, npa = numpy_forward(cfg, P, ids)
-    npz_arr = npz.load() if hasattr(npz, "load") else npz
+    nplogits, ref_z, ref_a = numpy_forward(cfg, P, ids)
+    npz = np.load(out_dir / "fixture.npz")
     # G1: torch fixture vs numpy reference
-    e1 = rel_err(npz_arr["logits"], nplogits)
+    e1 = rel_err(npz["logits"], nplogits)
     print(f"G1 torch-vs-numpy logits rel_err = {e1:.3e}  {'PASS' if e1 < 1e-5 else 'FAIL'}")
     if e1 >= 1e-5:
         print("G1 FAILED: numpy reference does not match torch; do not trust G2+")
         sys.exit(1)
 
+    if args.dtype is None:
+        args.dtype = "fp32" if args.device == "CPU" else "fp16"
     model, c = build_model(cfg, P)
     model.act_dtype = ms.float32 if args.dtype == "fp32" else (
         ms.float16 if args.dtype == "fp16" else ms.bfloat16)
