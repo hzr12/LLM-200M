@@ -111,8 +111,10 @@ class Attention(nn.Cell):
     """GQA attention. fused FA (BNSD, sparse_mode) when the probe passed.
 
     _fa_ok is decided once by the startup probe (forward + grad with the real
-    training shape) and cached at class level. sparse_mode comes from
-    LLM_SNN_FA_SPARSE_MODE (default 2 = causal, CANN convention).
+    training shape) and cached at class level. The FA path repeats kv to
+    n_heads first (uniform-head FA: the CANN GQA backward path is broken on
+    this stack — aclnnReduceSum EZ1001). sparse_mode from
+    LLM_SNN_FA_SPARSE_MODE (default 0 = built-in causal).
     """
     _fa_ok: bool | None = None
     _fa_warned: bool = False
@@ -125,7 +127,7 @@ class Attention(nn.Cell):
         self.head_dim = cfg.head_dim
         self.repeats = self.n_heads // self.n_kv_heads
         self._scale = self.head_dim ** -0.5
-        self._sparse_mode = int(os.environ.get("LLM_SNN_FA_SPARSE_MODE", "2"))
+        self._sparse_mode = int(os.environ.get("LLM_SNN_FA_SPARSE_MODE", "0"))
         d = cfg.d_model
         qkv_out = (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
         self.qkv_w_T = ms.Parameter(
@@ -164,6 +166,9 @@ class Attention(nn.Cell):
         use_fa = (Attention._fa_ok is True
                   and x.dtype in (ms.float16, ms.bfloat16))
         if use_fa:
+            if self.repeats > 1:
+                k = k.repeat_interleave(self.repeats, dim=1)
+                v = v.repeat_interleave(self.repeats, dim=1)
             out = ops.flash_attention_score(
                 q, k, v, self.n_heads,
                 keep_prob=1.0, scalar_value=self._scale,
@@ -216,6 +221,7 @@ class Router(nn.Cell):
 
 class MoEBlock(nn.Cell):
     """Attention + MoE (dense-mask, fused expert weights)."""
+    _swiglu_ok: bool | None = None  # set by probe_fused_ops (910B has ops.swiglu)
 
     def __init__(self, cfg: Config, layer_id: int, router: Router):
         super().__init__()
@@ -246,10 +252,13 @@ class MoEBlock(nn.Cell):
         EH = self.W_gu_T.shape[-1] // 2
         E, H = self.n_experts, EH // self.n_experts
         gu = _ld(flat, self.W_gu_T)            # [S, 2*EH]
-        g_all, u_all = gu[..., :EH], gu[..., EH:]
-        g = g_all.reshape(S, E, H)
-        u = u_all.reshape(S, E, H)
-        a = g * ops.sigmoid(g) * u            # silu(g) * u; sigmoid avoids ops.silu (absent on 2.2)
+        if MoEBlock._swiglu_ok is True:
+            a = ops.swiglu(gu).reshape(S, E, H)   # fused silu(gate)*up (910B)
+        else:
+            g_all, u_all = gu[..., :EH], gu[..., EH:]
+            g = g_all.reshape(S, E, H)
+            u = u_all.reshape(S, E, H)
+            a = g * ops.sigmoid(g) * u            # silu(g) * u; sigmoid avoids ops.silu (absent on 2.2)
         w = (ops.one_hot(top_idx, E, 1.0, 0.0, axis=-1).to(x.dtype)
              * top_probs.to(x.dtype).unsqueeze(-1)).sum(axis=1)  # [S, E]
         a = a * w.unsqueeze(-1)
@@ -300,9 +309,11 @@ class MoETransformer(nn.Cell):
         """Startup probes (PYNATIVE mode, before switching to GRAPH).
 
         - RMSNorm fused ops.RmsNorm: fwd + grad parity vs elementwise.
+        - SwiGLU ops.swiglu: fwd parity vs silu(g)*u (910B only).
         - FlashAttention ops.flash_attention_score: fwd + grad on the real
-          training shape; checks sparse_mode 2 then 0 (env override first).
-        Sets RMSNorm._fused_ok / Attention._fa_ok at class level.
+          training shape, using exactly the model path (kv repeated to
+          n_heads, sparse_mode from env, default 0).
+        Sets RMSNorm._fused_ok / MoEBlock._swiglu_ok / Attention._fa_ok.
         """
         B, T, D = batch, seq_len, self.cfg.d_model
         print(f"probe: fused ops with shape B={B} T={T} dtype={dtype}", flush=True)
@@ -345,6 +356,29 @@ class MoETransformer(nn.Cell):
             except Exception as e:  # noqa: BLE001
                 RMSNorm._fused_ok = False
                 print(f"probe: RmsNorm fused FAILED ({e!r}) -> _fused_ok=False", flush=True)
+        # --- SwiGLU (ops.swiglu: silu(x[..., :H]) * x[..., H:]) ---
+        if not hasattr(ops, "swiglu"):
+            MoEBlock._swiglu_ok = False
+            print("probe: ops.swiglu unavailable -> elementwise silu", flush=True)
+        else:
+            try:
+                EH = self.cfg.n_experts * self.cfg.expert_hidden
+                gu = ms.Tensor(np.random.randn(64, 2 * EH).astype(np.float32) * 0.5, dtype)
+                class SwiProbe(nn.Cell):
+                    def construct(self, xx):
+                        return ops.swiglu(xx).sum()
+                class SwiElem(nn.Cell):
+                    def construct(self, xx):
+                        g, u = xx[..., :EH], xx[..., EH:]
+                        return (g * ops.sigmoid(g) * u).sum()
+                l1 = SwiProbe()(gu)
+                l2 = SwiElem()(gu)
+                err = float(abs(l1.asnumpy() - l2.asnumpy())) / max(1.0, float(abs(l2.asnumpy())))
+                MoEBlock._swiglu_ok = err < 1e-2
+                print(f"probe: swiglu rel_err={err:.4f} -> _swiglu_ok={MoEBlock._swiglu_ok}", flush=True)
+            except Exception as e:  # noqa: BLE001
+                MoEBlock._swiglu_ok = False
+                print(f"probe: swiglu FAILED ({e!r}) -> _swiglu_ok=False", flush=True)
         # --- FlashAttention ---
         if not (hasattr(ops, "flash_attention_score")
                 and dtype in (ms.float16, ms.bfloat16)):
@@ -352,16 +386,21 @@ class MoETransformer(nn.Cell):
             print("probe: flash_attention_score unavailable -> slow attention", flush=True)
             return
         N, KV, HD = self.cfg.n_heads, self.cfg.n_kv_heads, self.cfg.head_dim
+        repeats = N // KV
         q = ms.Tensor(np.random.randn(B, N, T, HD).astype(np.float32) * 0.5, dtype)
         k = ms.Tensor(np.random.randn(B, KV, T, HD).astype(np.float32) * 0.5, dtype)
         v = ms.Tensor(np.random.randn(B, KV, T, HD).astype(np.float32) * 0.5, dtype)
         scale = HD ** -0.5
 
         class FAProbe(nn.Cell):
-            def __init__(self, smode):
+            def __init__(self, smode, rpts):
                 super().__init__()
                 self.smode = smode
+                self.rpts = rpts
             def construct(self, qq, kk, vv):
+                if self.rpts > 1:
+                    kk = kk.repeat_interleave(self.rpts, dim=1)
+                    vv = vv.repeat_interleave(self.rpts, dim=1)
                 out = ops.flash_attention_score(
                     qq, kk, vv, N, keep_prob=1.0, scalar_value=scale,
                     pre_tokens=2147483647, next_tokens=0, inner_precise=0,
@@ -369,10 +408,10 @@ class MoETransformer(nn.Cell):
                 y = out[0] if isinstance(out, tuple) else out
                 return y.sum()
 
-        smodes = [int(os.environ.get("LLM_SNN_FA_SPARSE_MODE", "2"))]
-        for s in smodes + [m for m in (2, 0) if m not in smodes]:
+        smodes = [int(os.environ.get("LLM_SNN_FA_SPARSE_MODE", "0"))]
+        for s in smodes + [m for m in (0,) if m not in smodes]:
             try:
-                gfn = ms.value_and_grad(FAProbe(s), grad_position=(0, 1, 2))
+                gfn = ms.value_and_grad(FAProbe(s, repeats), grad_position=(0, 1, 2))
                 loss, (dq, dk, dv) = gfn(q, k, v)
                 finite = (np.isfinite(loss.asnumpy()).all()
                           and np.isfinite(dq.asnumpy()).all()
@@ -382,7 +421,7 @@ class MoETransformer(nn.Cell):
                     Attention._fa_ok = True
                     for layer in self.layers:
                         layer.attn._sparse_mode = s
-                    print(f"probe: FA OK sparse_mode={s} -> _fa_ok=True", flush=True)
+                    print(f"probe: FA OK sparse_mode={s} (kv repeated) -> _fa_ok=True", flush=True)
                     return
                 print(f"probe: FA sparse_mode={s} non-finite grads, trying next", flush=True)
             except Exception as e:  # noqa: BLE001
